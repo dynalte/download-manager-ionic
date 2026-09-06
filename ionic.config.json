@@ -1,0 +1,8 @@
+{
+  "name": "download-manager-ionic",
+  "integrations": {
+    "capacitor": {}
+  },
+  "type": "custom",
+  "id": "net.tr4ker.downloadmanager"
+}

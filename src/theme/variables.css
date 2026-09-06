@@ -1,0 +1,201 @@
+/* Thème Download Manager — clair soigné + sombre (classe html.ion-palette-dark). */
+
+/* ---------- Palette de marque (clair) ---------- */
+:root {
+  --ion-safe-area-top: env(safe-area-inset-top);
+  --ion-safe-area-bottom: env(safe-area-inset-bottom);
+
+  --ion-color-primary: #4f46e5;
+  --ion-color-primary-rgb: 79, 70, 229;
+  --ion-color-primary-contrast: #ffffff;
+  --ion-color-primary-contrast-rgb: 255, 255, 255;
+  --ion-color-primary-shade: #453dd0;
+  --ion-color-primary-tint: #615ce8;
+
+  --ion-background-color: #f4f5fa;
+  --ion-background-color-rgb: 244, 245, 250;
+  --ion-text-color: #141824;
+  --ion-text-color-rgb: 20, 24, 36;
+  --ion-border-color: #e4e7f0;
+  --ion-card-background: #ffffff;
+  --ion-toolbar-background: #ffffff;
+  --ion-tab-bar-background: rgba(255, 255, 255, 0.92);
+  --ion-item-background: transparent;
+
+  /* Vars propres à l'app */
+  --app-card: #ffffff;
+  --app-border: #e4e7f0;
+  --app-shadow: 0 8px 24px rgba(20, 24, 36, 0.08);
+  --app-radius: 16px;
+  --app-error-bg: #fde7e7;
+}
+
+/* ---------- Sombre (via classe, pilotée par src/services/theme.ts) ---------- */
+html.ion-palette-dark {
+  color-scheme: dark;
+
+  --ion-color-primary: #818cf8;
+  --ion-color-primary-rgb: 129, 140, 248;
+  --ion-color-primary-contrast: #0a0c12;
+  --ion-color-primary-contrast-rgb: 10, 12, 18;
+  --ion-color-primary-shade: #6f7bf5;
+  --ion-color-primary-tint: #939df9;
+
+  --ion-background-color: #0b0e14;
+  --ion-background-color-rgb: 11, 14, 20;
+  --ion-text-color: #e8eaf2;
+  --ion-text-color-rgb: 232, 234, 242;
+  --ion-border-color: #232a3b;
+  --ion-card-background: #151a26;
+  --ion-toolbar-background: #10141d;
+  --ion-tab-bar-background: rgba(16, 20, 29, 0.92);
+  --ion-item-background: transparent;
+
+  --app-card: #151a26;
+  --app-border: #232a3b;
+  --app-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  --app-error-bg: #3a1d1d;
+}
+
+/* ---------- Base ---------- */
+ion-content {
+  --background: var(--ion-background-color);
+}
+
+ion-toolbar {
+  --border-color: var(--app-border);
+}
+
+ion-tab-bar {
+  --border: 1px solid var(--app-border);
+}
+
+ion-button {
+  --border-radius: 12px;
+  font-weight: 600;
+}
+
+ion-card {
+  border-radius: var(--app-radius);
+  box-shadow: var(--app-shadow);
+  border: 1px solid var(--app-border);
+  background: var(--app-card);
+}
+
+ion-modal {
+  --border-radius: 20px 20px 0 0;
+}
+
+ion-toast {
+  --border-radius: 12px;
+}
+
+ion-segment {
+  --background: var(--app-card);
+  border: 1px solid var(--app-border);
+  border-radius: 14px;
+  margin: 12px 12px 4px;
+}
+
+ion-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+ion-list {
+  background: transparent;
+}
+
+ion-item {
+  --border-color: var(--app-border);
+}
+
+/* ---------- Blocs applicatifs ---------- */
+.status-bar {
+  font-size: 12px;
+  color: var(--ion-color-medium);
+  padding: 10px 14px;
+  margin: 12px;
+  background: var(--app-card);
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+}
+
+.footer-message {
+  font-size: 12px;
+  margin: 0 14px 10px;
+}
+
+/* Bandeau d'erreur fin (onglet Site, exe) */
+.error-banner {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: var(--app-error-bg);
+  border: 1px solid var(--ion-color-danger-tint, #f3b4b4);
+  border-radius: 12px;
+  padding: 6px 6px 6px 12px;
+  box-shadow: var(--app-shadow);
+}
+
+/* Cadre webview TR4KER inline (exe) : flottant, arrondi */
+.webview-wrap {
+  height: 100%;
+  padding: 12px;
+  background: var(--ion-background-color);
+}
+
+.webview-wrap webview {
+  width: 100%;
+  height: 100%;
+  border-radius: var(--app-radius);
+  border: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow);
+  background: #fff;
+  overflow: hidden;
+}
+
+html.ion-palette-dark .webview-wrap webview {
+  background: #000;
+}
+
+.torrent-iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+}
+
+html.ion-palette-dark .torrent-iframe {
+  background: #000;
+}
+
+.poster-thumb {
+  width: 48px;
+  height: 70px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--app-border);
+}
+
+.poster-large {
+  width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+  border-radius: 12px;
+  background: var(--app-border);
+}
+
+.poster-grid {
+  width: 100%;
+  height: 130px;
+  object-fit: cover;
+  border-radius: 10px;
+  background: var(--app-border);
+}

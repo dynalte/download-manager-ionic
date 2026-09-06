@@ -2,7 +2,7 @@ node_modules/
 dist/
 release/
 electron-dist/
-ios/
+/ios/
 android/
 .plugins/
 .opencode/

@@ -17,9 +17,9 @@ import {
   useIonViewDidEnter,
   useIonViewWillLeave,
 } from '@ionic/react';
-import { openOutline, downloadOutline, magnetOutline, filmOutline, phonePortraitOutline } from 'ionicons/icons';
+import { openOutline, downloadOutline, magnetOutline, filmOutline, phonePortraitOutline, arrowBackOutline, arrowForwardOutline, refreshOutline } from 'ionicons/icons';
 import { Browser } from '@capacitor/browser';
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import { TR4KER_URL } from '../config/appConfig';
 import { transmissionPath, type DestinationFolder } from '../services/settings';
@@ -31,8 +31,11 @@ import {
   openTr4kerEmbedded,
   isDesktopElectron,
   TR4KER_WEBVIEW_INTERCEPTOR_JS,
+  INTERCEPTOR_WKWEBVIEW_JS,
   handleGuestTorrentMessage,
+  type EmbeddedCallbacks,
 } from '../services/embeddedBrowser';
+import { InlineBrowser, type InlineBrowserState, type UrlChangeEvent } from '../services/inlineBrowser';
 import FolderSheet from '../components/FolderSheet';
 import { requestBrowserOpen } from '../services/browserNavigation';
 
@@ -50,6 +53,20 @@ const SiteTab: React.FC = () => {
   const browserRef = useRef<{ close: () => Promise<void> } | null>(null);
   // Exe Windows : le site est affiché inline dans l'onglet (balise <webview>).
   const isElectron = useRef(isDesktopElectron()).current;
+  // iOS natif : TR4KER affiché inline dans l'onglet (plugin InlineBrowser,
+  // WKWebView positionnée sur le conteneur). Autres natifs : modale plein écran.
+  const useInlineTr4ker = useRef(Capacitor.getPlatform() === 'ios').current;
+  const inlineContainerRef = useRef<HTMLDivElement>(null);
+  const inlineOpenedRef = useRef(false);
+  const inlineListenersRef = useRef<PluginListenerHandle[]>([]);
+  const inlineRectRafRef = useRef(0);
+  const [inlineState, setInlineState] = useState<InlineBrowserState>({
+    url: TR4KER_URL,
+    canGoBack: false,
+    canGoForward: false,
+  });
+  const [inlineFailed, setInlineFailed] = useState(false);
+  const [showManual, setShowManual] = useState(false);
   const webviewRef = useRef<any>(null);
   const [tr4kerPreloadPath, setTr4kerPreloadPath] = useState<string | null>(null);
   const autoOpenRef = useRef(false);
@@ -60,7 +77,152 @@ const SiteTab: React.FC = () => {
     autoOpenRef.current = false;
     void browserRef.current?.close().catch(() => {});
     browserRef.current = null;
+    if (useInlineTr4ker) void closeInline();
   });
+
+  /** Callbacks d'interception TR4KER partagés (modale + inline iOS). */
+  function tr4kerCallbacks(closeAfterIntercept: boolean): EmbeddedCallbacks {
+    return {
+      onMagnet: (magnetURL: string, pageURL: string) => {
+        if (closeAfterIntercept) void browserRef.current?.close().catch(() => {});
+        setToast('Magnet intercepté');
+        handleIncoming({ kind: 'magnet', filename: '', sourceURL: '', pageURL, magnetURL }, null);
+      },
+      onTorrentBytes: (t) => {
+        if (closeAfterIntercept) void browserRef.current?.close().catch(() => {});
+        try {
+          const bytes = base64ToBytes(t.bytesBase64);
+          setToast('Torrent intercepté');
+          handleIncoming(
+            { kind: 'torrent', filename: normalizeTorrentFilename(t.filename), sourceURL: t.sourceURL, pageURL: t.pageURL, magnetURL: '' },
+            bytes,
+          );
+        } catch (e) {
+          setErrorMessage(e instanceof Error ? e.message : String(e));
+        }
+      },
+      onTorrentUrl: (url: string, pageURL: string) => {
+        // Le fetch intra-page a échoué (ex: 401) : on retente en fetch direct
+        // puis on rend la main à l'utilisateur via la fiche dossier.
+        if (closeAfterIntercept) void browserRef.current?.close().catch(() => {});
+        void (async () => {
+          try {
+            setStatusMessage('Telechargement du torrent...');
+            const { bytes, filename } = await downloadTorrentBytes(url, TR4KER_URL);
+            handleIncoming({ kind: 'torrent', filename, sourceURL: url, pageURL, magnetURL: '' }, bytes);
+          } catch (e) {
+            setErrorMessage(
+              `Lien intercepté mais téléchargement impossible (${e instanceof Error ? e.message : String(e)}). ` +
+                `Colle-le manuellement ci-dessous ou vérifie ta session TR4KER.`,
+            );
+            setStatusMessage('Erreur');
+            setUrlInput(url);
+          }
+        })();
+      },
+      onClose: () => {
+        browserRef.current = null;
+      },
+      // Bouton Allociné injecté sur les fiches : ne referme rien, ouvre à côté.
+      onAllocine: (title: string) => {
+        setToast('Fiche Allociné');
+        openAllocineForTitle(title);
+      },
+    };
+  }
+
+  function measureInlineRect() {
+    const el = inlineContainerRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < 10 || r.height < 10) return null;
+    return { x: r.left, y: r.top, width: r.width, height: r.height };
+  }
+
+  /** Repositionne la vue inline (rotation, clavier, section manuelle...). */
+  function scheduleInlineRectSync() {
+    if (!inlineOpenedRef.current) return;
+    cancelAnimationFrame(inlineRectRafRef.current);
+    inlineRectRafRef.current = requestAnimationFrame(() => {
+      const rect = measureInlineRect();
+      if (rect) void InlineBrowser.setRect(rect).catch(() => {});
+    });
+  }
+
+  /** Ouvre TR4KER inline dans l'onglet (iOS). Échec -> écran de secours avec modale. */
+  async function openInline() {
+    if (inlineOpenedRef.current) return;
+    setInlineFailed(false);
+    setErrorMessage('');
+    try {
+      // Attend la mise en page pour mesurer le conteneur.
+      await new Promise((res) => requestAnimationFrame(() => res(null)));
+      const rect = measureInlineRect();
+      if (!rect) throw new Error('Conteneur TR4KER non mesurable');
+      await InlineBrowser.open({ url: TR4KER_URL, ...rect });
+      inlineOpenedRef.current = true;
+      const cbs = tr4kerCallbacks(false);
+      inlineListenersRef.current = [
+        await InlineBrowser.addListener('browserMessage', (msg) => {
+          handleGuestTorrentMessage(msg, cbs);
+        }),
+        await InlineBrowser.addListener('urlChange', (ev: UrlChangeEvent) => {
+          if (ev.navigation === 'magnet' || isMagnetUrl(ev.url)) {
+            cbs.onMagnet(ev.url, '');
+          } else if (shouldHandleAsTorrentUrl(ev.url)) {
+            cbs.onTorrentUrl(ev.url, '');
+          }
+        }),
+        await InlineBrowser.addListener('load', (state) => {
+          setInlineState(state);
+          // Réinjection après chaque chargement (garde interne anti-double).
+          void InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
+        }),
+      ];
+      // Première injection (si la page est déjà chargée avant le 1er event load).
+      await InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
+      setStatusMessage('TR4KER chargé dans l’onglet : touche un lien .torrent / magnet pour l’intercepter');
+    } catch (e) {
+      inlineOpenedRef.current = false;
+      setInlineFailed(true);
+      setErrorMessage(e instanceof Error ? e.message : String(e));
+      setStatusMessage('Erreur');
+    }
+  }
+
+  async function closeInline() {
+    inlineListenersRef.current.forEach((h) => {
+      try {
+        h.remove();
+      } catch {
+        /* ignore */
+      }
+    });
+    inlineListenersRef.current = [];
+    inlineOpenedRef.current = false;
+    cancelAnimationFrame(inlineRectRafRef.current);
+    try {
+      await InlineBrowser.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function inlineBack() {
+    void InlineBrowser.goBack()
+      .then((s) => setInlineState(s))
+      .catch(() => {});
+  }
+
+  function inlineForward() {
+    void InlineBrowser.goForward()
+      .then((s) => setInlineState(s))
+      .catch(() => {});
+  }
+
+  function inlineReload() {
+    void InlineBrowser.reload().catch(() => {});
+  }
 
   async function sendToTransmission(payload: PendingPayload, bytes: Uint8Array | null, folder: DestinationFolder, auto = false) {
     try {
@@ -229,12 +391,50 @@ const SiteTab: React.FC = () => {
   }
 
   // Mobile : le site s'ouvre directement à l'entrée sur l'onglet, sans bouton.
+  // iOS : inline dans l'onglet (plugin InlineBrowser). Autres natifs : modale.
   useIonViewDidEnter(() => {
     if (isElectron || !Capacitor.isNativePlatform()) return;
+    if (useInlineTr4ker) {
+      if (!inlineOpenedRef.current && !pending) void openInline();
+      else scheduleInlineRectSync();
+      return;
+    }
     if (autoOpenRef.current || pending) return;
     autoOpenRef.current = true;
     void openEmbedded();
   });
+
+  // iOS inline : suit les changements de mise en page (rotation, clavier,
+  // section manuelle) pour garder la vue native alignée sur le conteneur.
+  useEffect(() => {
+    if (!useInlineTr4ker) return;
+    const el = inlineContainerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => scheduleInlineRectSync());
+    ro.observe(el);
+    const onResize = () => scheduleInlineRectSync();
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useInlineTr4ker, showManual]);
+
+  // iOS inline : la vue native recouvre la WebView Ionic, donc aussi la fiche
+  // dossier. On la masque (sans la détruire : la page reste chargée) quand la
+  // fiche s'ouvre, on la restore à la fermeture.
+  useEffect(() => {
+    if (!useInlineTr4ker) return;
+    if (pending) {
+      void InlineBrowser.setRect({ x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
+    } else if (inlineOpenedRef.current) {
+      scheduleInlineRectSync();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending]);
 
   // Exe Windows : chemin du preload minimal de la <webview> inline.
   useEffect(() => {
@@ -385,22 +585,101 @@ const SiteTab: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isElectron, tr4kerPreloadPath]);
 
+  /** Outils d'ajout manuel (lien, fichier, Allociné) : affichés en clair sur
+      les autres plateformes, repliables au-dessus du navigateur inline sur iOS. */
+  function renderManualTools() {
+    return (
+      <>
+        <IonItem>
+          <IonInput
+            label="Lien .torrent ou magnet"
+            labelPlacement="stacked"
+            placeholder="https://.../download.torrent ou magnet:?xt=..."
+            value={urlInput}
+            onIonInput={(e) => setUrlInput(String(e.detail.value ?? ''))}
+          />
+        </IonItem>
+        <IonItem lines="none">
+          <IonButton expand="block" onClick={() => void handleUrlSubmit()} style={{ flex: 1 }}>
+            <IonIcon icon={downloadOutline} slot="start" />
+            Intercepter / Ajouter
+          </IonButton>
+          <IonButton fill="outline" onClick={() => fileRef.current?.click()}>
+            <IonIcon icon={magnetOutline} slot="start" />
+            Fichier .torrent
+          </IonButton>
+        </IonItem>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".torrent,application/x-bittorrent"
+          hidden
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) void handleFilePicked(f);
+            e.target.value = '';
+          }}
+        />
+
+        <IonItem>
+          <IonInput
+            label="Titre du film / serie (bouton Allocine)"
+            labelPlacement="stacked"
+            placeholder="Ex: Dune Deuxieme partie"
+            value={titleInput}
+            onIonInput={(e) => setTitleInput(String(e.detail.value ?? ''))}
+          />
+        </IonItem>
+        <IonItem lines="none">
+          <IonButton
+            fill="outline"
+            disabled={!titleInput.trim()}
+            onClick={() => void Browser.open({ url: buildAllocineUrl(titleInput) })}
+            style={{ flex: 1 }}
+          >
+            <IonIcon icon={filmOutline} slot="start" />
+            Ouvrir Allocine
+          </IonButton>
+        </IonItem>
+      </>
+    );
+  }
+
   return (
     <IonPage>
       <IonHeader>
         <IonToolbar>
           <IonTitle>Site</IonTitle>
           <IonButtons slot="end">
-            <IonButton onClick={() => void openEmbedded()}>
-              <IonIcon icon={phonePortraitOutline} />
-            </IonButton>
-            <IonButton onClick={() => void Browser.open({ url: TR4KER_URL })}>
-              <IonIcon icon={openOutline} />
-            </IonButton>
+            {useInlineTr4ker ? (
+              <>
+                <IonButton onClick={inlineBack} disabled={!inlineState.canGoBack}>
+                  <IonIcon icon={arrowBackOutline} />
+                </IonButton>
+                <IonButton onClick={inlineForward} disabled={!inlineState.canGoForward}>
+                  <IonIcon icon={arrowForwardOutline} />
+                </IonButton>
+                <IonButton onClick={inlineReload}>
+                  <IonIcon icon={refreshOutline} />
+                </IonButton>
+                <IonButton onClick={() => void Browser.open({ url: inlineState.url || TR4KER_URL })}>
+                  <IonIcon icon={openOutline} />
+                </IonButton>
+              </>
+            ) : (
+              <>
+                <IonButton onClick={() => void openEmbedded()}>
+                  <IonIcon icon={phonePortraitOutline} />
+                </IonButton>
+                <IonButton onClick={() => void Browser.open({ url: TR4KER_URL })}>
+                  <IonIcon icon={openOutline} />
+                </IonButton>
+              </>
+            )}
           </IonButtons>
         </IonToolbar>
       </IonHeader>
-      <IonContent fullscreen>
+      <IonContent fullscreen scrollY={isElectron || !useInlineTr4ker}>
         {isElectron ? (
           /* Exe Windows : TR4KER seul, plein onglet (pas de formulaire dessous).
              La fiche dossier + toast restent (overlays). Les erreurs s'affichent
@@ -431,6 +710,52 @@ const SiteTab: React.FC = () => {
               </IonItem>
             )}
           </div>
+        ) : useInlineTr4ker ? (
+          /* iOS natif : TR4KER directement dans l'onglet (WKWebView inline).
+             La fiche dossier + toast restent (overlays Ionic révélés en
+             masquant temporairement la vue native, voir effet sur pending). */
+          <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+            {inlineFailed ? (
+              <IonCard>
+                <IonCardContent style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <p style={{ flex: 1, margin: 0 }}>
+                    Affichage intégré indisponible. Rouvre TR4KER ou bascule en plein écran.
+                  </p>
+                  <IonButton size="small" onClick={() => void openInline()}>
+                    Réessayer
+                  </IonButton>
+                  <IonButton size="small" fill="outline" onClick={() => void openEmbedded()}>
+                    Plein écran
+                  </IonButton>
+                </IonCardContent>
+              </IonCard>
+            ) : (
+              <div style={{ padding: '4px 8px', display: 'flex', gap: 8, alignItems: 'center' }}>
+                <IonText color="medium" style={{ flex: 1, overflow: 'hidden' }}>
+                  <small
+                    style={{
+                      display: 'block',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {inlineState.url || TR4KER_URL}
+                  </small>
+                </IonText>
+                <IonButton size="small" fill="clear" onClick={() => setShowManual((v) => !v)}>
+                  {showManual ? 'Masquer' : 'Manuel'}
+                </IonButton>
+              </div>
+            )}
+            {showManual && !inlineFailed && <div>{renderManualTools()}</div>}
+            <div ref={inlineContainerRef} style={{ flex: 1, minHeight: 0, position: 'relative' }} />
+            <div style={{ padding: '2px 12px 6px' }}>
+              <IonText color={errorMessage ? 'danger' : 'medium'}>
+                <small>{errorMessage || `Statut : ${statusMessage}`}</small>
+              </IonText>
+            </div>
+          </div>
         ) : (
           <>
             {/* Mobile : ouverture auto à l'entrée ; bouton compact pour rouvrir.
@@ -456,57 +781,7 @@ const SiteTab: React.FC = () => {
               </IonCardContent>
             </IonCard>
 
-            <IonItem>
-              <IonInput
-                label="Lien .torrent ou magnet"
-                labelPlacement="stacked"
-                placeholder="https://.../download.torrent ou magnet:?xt=..."
-                value={urlInput}
-                onIonInput={(e) => setUrlInput(String(e.detail.value ?? ''))}
-              />
-            </IonItem>
-            <IonItem lines="none">
-              <IonButton expand="block" onClick={() => void handleUrlSubmit()} style={{ flex: 1 }}>
-                <IonIcon icon={downloadOutline} slot="start" />
-                Intercepter / Ajouter
-              </IonButton>
-              <IonButton fill="outline" onClick={() => fileRef.current?.click()}>
-                <IonIcon icon={magnetOutline} slot="start" />
-                Fichier .torrent
-              </IonButton>
-            </IonItem>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".torrent,application/x-bittorrent"
-              hidden
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void handleFilePicked(f);
-                e.target.value = '';
-              }}
-            />
-
-            <IonItem>
-              <IonInput
-                label="Titre du film / serie (bouton Allocine)"
-                labelPlacement="stacked"
-                placeholder="Ex: Dune Deuxieme partie"
-                value={titleInput}
-                onIonInput={(e) => setTitleInput(String(e.detail.value ?? ''))}
-              />
-            </IonItem>
-            <IonItem lines="none">
-              <IonButton
-                fill="outline"
-                disabled={!titleInput.trim()}
-                onClick={() => void Browser.open({ url: buildAllocineUrl(titleInput) })}
-                style={{ flex: 1 }}
-              >
-                <IonIcon icon={filmOutline} slot="start" />
-                Ouvrir Allocine
-              </IonButton>
-            </IonItem>
+            {renderManualTools()}
 
             <div className="status-bar">
               <div>Statut: {statusMessage}</div>

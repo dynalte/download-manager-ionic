@@ -339,6 +339,11 @@ export const TR4KER_WEBVIEW_INTERCEPTOR_JS = buildTr4kerGuestInterceptor(
   'window.__tr4kerBridge.postTorrent(detail)',
 );
 
+/** Version iOS inline : poste via le pont WKWebView du plugin InlineBrowser. */
+export const INTERCEPTOR_WKWEBVIEW_JS = buildTr4kerGuestInterceptor(
+  'window.webkit.messageHandlers.tr4kerBridge.postMessage(detail)',
+);
+
 export async function openTr4kerEmbedded(
   siteURL: string,
   cb: EmbeddedCallbacks,

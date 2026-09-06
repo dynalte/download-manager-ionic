@@ -1,0 +1,11 @@
+{
+  "name": "@tr4ker/inline-browser",
+  "version": "0.1.0",
+  "description": "WKWebView inline iOS pour afficher TR4KER dans l'onglet Site",
+  "license": "MIT",
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    }
+  }
+}

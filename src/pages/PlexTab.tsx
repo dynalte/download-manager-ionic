@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   IonPage,
   IonHeader,
@@ -19,6 +19,7 @@ import {
   IonBadge,
   IonRefresher,
   IonRefresherContent,
+  IonFooter,
   RefresherEventDetail,
 } from '@ionic/react';
 import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline } from 'ionicons/icons';
@@ -37,9 +38,12 @@ import {
 } from '../services/plex';
 import { settings, Keys } from '../services/settings';
 import { buildAllocineUrl } from '../services/torrentScripts';
+import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
 import { requestBrowserOpen } from '../services/browserNavigation';
+import { isDesktopElectron } from '../services/embeddedBrowser';
 import SettingsModal from '../components/SettingsModal';
 import PlayerPicker from '../components/PlayerPicker';
+import RatingStars from '../components/RatingStars';
 
 type MediaFilter = 'all' | 'movies' | 'series';
 type WatchFilter = 'all' | 'watched' | 'unwatched';
@@ -69,6 +73,31 @@ const PlexTab: React.FC = () => {
   const [season, setSeason] = useState<PlexSeasonItem | null>(null);
   const [episodes, setEpisodes] = useState<PlexEpisodeItem[]>([]);
   const [loadingEpisodes, setLoadingEpisodes] = useState(false);
+  const [ratings, setRatings] = useState<AllocineRatings | null>(null);
+  const [ratingsLoading, setRatingsLoading] = useState(false);
+  const ratingsReq = useRef(0);
+  /** Notes par item.id pour la liste/grille (rempli en arrière-plan). */
+  const [ratingsMap, setRatingsMap] = useState<Record<string, AllocineRatings>>({});
+  const ratingsMapRef = useRef<Record<string, AllocineRatings>>({});
+  const ratingsFillReq = useRef(0);
+
+  /** Note la plus parlante pour l'affichage compact (spectateurs > presse). */
+  function bestNote(r: AllocineRatings): number | null {
+    return r.spectators ?? r.press;
+  }
+
+  /** Étoiles compactes d'un item de liste/grille (rien si pas encore chargé). */
+  const ListRating: React.FC<{ item: PlexLibraryItem }> = ({ item }) => {
+    const r = ratingsMap[item.id];
+    const v = r ? bestNote(r) : null;
+    if (v == null) return null;
+    return (
+      <span className="ratings-inline">
+        <RatingStars value={v} size={14} />
+        <strong>{formatAllocineNote(v)}</strong>
+      </span>
+    );
+  };
 
   const refreshLibraries = useCallback(async () => {
     setLoading(true);
@@ -111,6 +140,59 @@ const PlexTab: React.FC = () => {
     [libraries, mediaFilter, watchFilter],
   );
 
+  // Remplit les notes de la liste/grille en arrière-plan (exe uniquement) :
+  // visibles d'abord, concurrence limitée, cache main de 30 j, silencieux.
+  useEffect(() => {
+    if (!isDesktopElectron()) return;
+    const reqId = ++ratingsFillReq.current;
+    const seen = new Set<string>();
+    const queue: PlexLibraryItem[] = [];
+    for (const lib of filteredLibraries) {
+      for (const item of lib.items) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          queue.push(item);
+        }
+      }
+    }
+    for (const lib of libraries) {
+      for (const item of lib.items) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          queue.push(item);
+        }
+      }
+    }
+    const pending = queue.filter((item) => !ratingsMapRef.current[item.id]);
+    if (pending.length === 0) return;
+    let cursor = 0;
+    let active = 0;
+    const CONCURRENCY = 3;
+    const pump = () => {
+      if (ratingsFillReq.current !== reqId) return;
+      while (active < CONCURRENCY && cursor < pending.length) {
+        const item = pending[cursor++];
+        active += 1;
+        void fetchAllocineRatings(item.title, item.year)
+          .then((r) => {
+            if (r && ratingsFillReq.current === reqId) {
+              ratingsMapRef.current = { ...ratingsMapRef.current, [item.id]: r };
+              setRatingsMap(ratingsMapRef.current);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            active -= 1;
+            pump();
+          });
+      }
+    };
+    const stagger = window.setTimeout(pump, 600);
+    return () => {
+      window.clearTimeout(stagger);
+    };
+  }, [libraries, filteredLibraries]);
+
   async function preparePlayback(item: PlexLibraryItem) {
     setSelectedItem(item);
     setPlaybackMsg('Recherche des lecteurs Plex...');
@@ -141,6 +223,22 @@ const PlexTab: React.FC = () => {
   async function openDetail(item: PlexLibraryItem) {
     setDetail(item);
     setSeasons([]);
+    setRatings(null);
+    // Notes Allociné (exe uniquement, silencieux si indisponible).
+    const reqId = ++ratingsReq.current;
+    setRatingsLoading(true);
+    void fetchAllocineRatings(item.title, item.year)
+      .then((r) => {
+        if (ratingsReq.current === reqId) setRatings(r);
+        if (r) {
+          ratingsMapRef.current = { ...ratingsMapRef.current, [item.id]: r };
+          setRatingsMap(ratingsMapRef.current);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (ratingsReq.current === reqId) setRatingsLoading(false);
+      });
     if (item.type.toLowerCase() === 'show') {
       setLoadingSeasons(true);
       try {
@@ -277,6 +375,7 @@ const PlexTab: React.FC = () => {
                           <div className="poster-grid" />
                         )}
                         <div style={{ fontSize: 12 }}>{item.title}</div>
+                        <ListRating item={item} />
                         <IonBadge color={item.isWatched ? 'success' : 'warning'}>{item.isWatched ? 'Vu' : 'Non vu'}</IonBadge>
                       </div>
                     ))}
@@ -294,6 +393,7 @@ const PlexTab: React.FC = () => {
                             {item.year ?? 'annee ?'}
                             {item.addedAt ? ` • ajoute le ${item.addedAt.toLocaleDateString()}` : ''}
                           </p>
+                          <ListRating item={item} />
                           <IonBadge color={item.isWatched ? 'success' : 'warning'}>
                             {item.isWatched ? 'Vu' : 'Non vu'}
                           </IonBadge>
@@ -314,7 +414,7 @@ const PlexTab: React.FC = () => {
         )}
 
         {/* Fiche détail (film / serie) */}
-        <IonModal isOpen={detail !== null} onDidDismiss={() => setDetail(null)}>
+        <IonModal isOpen={detail !== null} onDidDismiss={() => setDetail(null)} className="detail-modal">
           <IonHeader>
             <IonToolbar>
               <IonTitle>Fiche detail</IonTitle>
@@ -325,17 +425,53 @@ const PlexTab: React.FC = () => {
           </IonHeader>
           <IonContent>
             {detail && (
-              <div style={{ padding: 16 }}>
-                {detail.posterURL && <img src={detail.posterURL} alt={detail.title} className="poster-large" />}
-                <h2>{detail.title}</h2>
-                <p>
-                  <IonBadge color={detail.isWatched ? 'success' : 'warning'}>
-                    {detail.isWatched ? 'Vu' : 'Non vu'}
-                  </IonBadge>
-                </p>
-                {detail.year && <p>Annee: {detail.year}</p>}
-                {detail.addedAt && <p>Ajoute le: {detail.addedAt.toLocaleString()}</p>}
-                <p>Type: {detail.type === 'show' ? 'Serie' : 'Film'}</p>
+              <div className="detail-sheet">
+                <div className="detail-top">
+                  {detail.posterURL && <img src={detail.posterURL} alt={detail.title} className="poster-large detail-poster" />}
+                  <div className="detail-head">
+                    <h2 className="detail-title">{detail.title}</h2>
+                    <p>
+                      <IonBadge className="detail-badge" color={detail.isWatched ? 'success' : 'warning'}>
+                        {detail.isWatched ? 'Vu' : 'Non vu'}
+                      </IonBadge>
+                    </p>
+                    {ratingsLoading ? (
+                      <p className="ratings-row">
+                        <IonSpinner style={{ width: 18, height: 18 }} />
+                        <IonText color="medium">Notes Allociné…</IonText>
+                      </p>
+                    ) : ratings && (ratings.press != null || ratings.spectators != null) ? (
+                      <div className="ratings-block">
+                        <IonBadge color="tertiary">Allociné</IonBadge>
+                        {ratings.press != null && (
+                          <div className="ratings-line">
+                            <RatingStars value={ratings.press} />
+                            <strong>{formatAllocineNote(ratings.press)}</strong>
+                            <IonText color="medium">
+                              <small>Presse{ratings.pressReviews ? ` • ${ratings.pressReviews} critiques` : ''}</small>
+                            </IonText>
+                          </div>
+                        )}
+                        {ratings.spectators != null && (
+                          <div className="ratings-line">
+                            <RatingStars value={ratings.spectators} />
+                            <strong>{formatAllocineNote(ratings.spectators)}</strong>
+                            <IonText color="medium">
+                              <small>
+                                Spectateurs{ratings.votes ? ` • ${ratings.votes.toLocaleString('fr-FR')} votes` : ''}
+                              </small>
+                            </IonText>
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
+                    <div className="detail-meta">
+                      {detail.year && <p>Annee: {detail.year}</p>}
+                      {detail.addedAt && <p>Ajoute le: {detail.addedAt.toLocaleString()}</p>}
+                      <p>Type: {detail.type === 'show' ? 'Serie' : 'Film'}</p>
+                    </div>
+                  </div>
+                </div>
                 {detail.type.toLowerCase() === 'show' && (
                   <div>
                     <h3>Saisons</h3>
@@ -358,17 +494,28 @@ const PlexTab: React.FC = () => {
                 )}
                 <h3>Synopsis</h3>
                 <IonText color="medium">
-                  <p>{detail.summary || 'Aucun resume disponible.'}</p>
+                  <p className="detail-summary">{detail.summary || 'Aucun resume disponible.'}</p>
                 </IonText>
-                <IonButton expand="block" onClick={() => void preparePlayback(detail)}>
+              </div>
+            )}
+          </IonContent>
+          <IonFooter>
+            <IonToolbar>
+              <div className="detail-actions">
+                <IonButton
+                  expand="block"
+                  onClick={() => detail && void preparePlayback(detail)}
+                  disabled={!detail}
+                >
                   <IonIcon icon={playOutline} slot="start" />
                   Lire sur Plex
                 </IonButton>
                 <IonButton
                   expand="block"
                   fill="outline"
-                  style={{ marginTop: 8 }}
+                  disabled={!detail}
                   onClick={() => {
+                    if (!detail) return;
                     requestBrowserOpen(buildAllocineUrl(detail.title));
                     setDetail(null);
                     history.push('/browser');
@@ -378,8 +525,8 @@ const PlexTab: React.FC = () => {
                   Voir sur Allociné
                 </IonButton>
               </div>
-            )}
-          </IonContent>
+            </IonToolbar>
+          </IonFooter>
         </IonModal>
 
         {/* Episodes de la saison */}
@@ -448,3 +595,4 @@ const PlexTab: React.FC = () => {
 };
 
 export default PlexTab;
+

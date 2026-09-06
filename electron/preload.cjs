@@ -27,5 +27,6 @@ contextBridge.exposeInMainWorld('desktop', {
   getTr4kerPreloadPath: () => ipcRenderer.invoke('tr4ker:preload-path'),
   attachTr4kerDownloads: (contentsId) => ipcRenderer.invoke('tr4ker:attach-downloads', contentsId),
   transmissionRpc: (args) => ipcRenderer.invoke('transmission:rpc', args),
+  allocineRatings: (args) => ipcRenderer.invoke('allocine:ratings', args),
   cookiesBackupNow: () => ipcRenderer.invoke('cookies:backup-now'),
 });

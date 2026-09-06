@@ -42,6 +42,16 @@ export interface DesktopBridge {
     password: string;
     payload: Record<string, unknown>;
   }) => Promise<Record<string, unknown>>;
+  /** Notes Allociné via le main (autocomplete + fiche SSR + cache). */
+  allocineRatings: (args: { query: string; year?: number | string }) => Promise<{
+    title: string;
+    year: string;
+    url: string;
+    press: number | null;
+    pressReviews: number | null;
+    spectators: number | null;
+    votes: number | null;
+  } | null>;
   /** Sauvegarde immédiate des cookies TR4KER (diagnostic). */
   cookiesBackupNow: () => Promise<{ saved: number }>;
 }

@@ -492,6 +492,162 @@ ipcMain.handle('tr4ker:close', () => {
   return { closed: true };
 });
 
+// --- Notes Allociné (automatiques) ---
+// Chaîne : autocomplete public (/_/autocomplete/<q>) -> fiche film/série SSR
+// -> notes presse/spectateurs parsées. Cache JSON 30 j + mémoire (500 entrées).
+const ALLOCINE_FILE = 'allocine-ratings.json';
+const ALLOCINE_TTL = 30 * 24 * 3600 * 1000;
+const allocineCache = new Map();
+
+function allocineCacheFile() {
+  try {
+    return path.join(app.getPath('userData'), ALLOCINE_FILE);
+  } catch {
+    return null;
+  }
+}
+
+function loadAllocineCache() {
+  try {
+    const f = allocineCacheFile();
+    if (!f) return;
+    const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (data && typeof data === 'object') {
+      for (const [k, v] of Object.entries(data)) {
+        if (v && typeof v === 'object') allocineCache.set(k, v);
+      }
+    }
+  } catch {
+    /* premier lancement */
+  }
+}
+
+function saveAllocineCache() {
+  try {
+    const f = allocineCacheFile();
+    if (!f) return;
+    const obj = {};
+    for (const [k, v] of allocineCache) obj[k] = v;
+    fs.writeFileSync(f, JSON.stringify(obj), 'utf8');
+  } catch {
+    /* ignore */
+  }
+}
+
+async function allocineGetText(url, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await net.fetch(url, {
+      signal: ctrl.signal,
+      headers: { Accept: 'text/html,application/json', 'Accept-Language': 'fr-FR,fr;q=0.9' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function parseAllocineNote(raw) {
+  if (raw === null || raw === undefined) return null;
+  const v = parseFloat(String(raw).replace(',', '.'));
+  if (!Number.isFinite(v) || v < 0 || v > 5) return null;
+  return Math.round(v * 10) / 10;
+}
+
+function parseAllocineVotes(txt) {
+  const m = /([\d\s]+)/.exec(String(txt || ''));
+  if (!m) return null;
+  const n = parseInt(m[1].replace(/\s/g, ''), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function allocineRatingsFor(query, year) {
+  const key = `${String(query || '').trim().toLowerCase()}|${String(year ?? '').trim()}`;
+  if (key === '|') return null;
+  const now = Date.now();
+  const hit = allocineCache.get(key);
+  if (hit && now - hit.at < ALLOCINE_TTL) return hit.data;
+  let data = null;
+  try {
+    const ac = JSON.parse(await allocineGetText(`https://www.allocine.fr/_/autocomplete/${encodeURIComponent(query.trim())}`, 12000));
+    const cands = ((ac && ac.results) || []).filter((r) => r && (r.entity_type === 'movie' || r.entity_type === 'series'));
+    if (cands.length === 0) throw new Error('no result');
+    // Préfère le même millésime que Plex quand il est connu (homonymes, remakes).
+    let best = cands[0];
+    const wantYear = year !== undefined && year !== null && String(year).trim() !== '' ? String(year).trim() : '';
+    if (wantYear) {
+      const same = cands.find((r) => r.data && String(r.data.year || '') === wantYear);
+      if (same) best = same;
+    }
+    const id = best.entity_id;
+    const pageUrl =
+      best.entity_type === 'series'
+        ? `https://www.allocine.fr/series/ficheserie_gen_cserie=${id}.html`
+        : `https://www.allocine.fr/film/fichefilm_gen_cfilm=${id}.html`;
+    const html = await allocineGetText(pageUrl, 15000);
+    let press = null;
+    let pressReviews = null;
+    let spectators = null;
+    let votes = null;
+    const re = /stareval-small[\s\S]{0,500}?stareval-note">([^<]+)<\/span><span class="stareval-review light">\s*([^<]*)/g;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const val = parseAllocineNote(m[1]);
+      const txt = (m[2] || '').trim();
+      if (val === null) continue;
+      if (/notes/i.test(txt)) {
+        if (spectators === null) {
+          spectators = val;
+          votes = parseAllocineVotes(txt);
+        }
+      } else if (/critiques/i.test(txt)) {
+        if (press === null) {
+          press = val;
+          pressReviews = parseAllocineVotes(txt);
+        }
+      }
+      if (press !== null && spectators !== null) break;
+    }
+    if (spectators === null) {
+      const ld = /"aggregateRating"\s*:\s*\{[^}]*"ratingValue"\s*:\s*"([\d.]+)"[^}]*"ratingCount"\s*:\s*"(\d+)"/.exec(html);
+      if (ld) {
+        spectators = parseAllocineNote(ld[1]);
+        const n = parseInt(ld[2], 10);
+        votes = Number.isFinite(n) ? n : null;
+      }
+    }
+    if (press === null && spectators === null) throw new Error('no rating');
+    data = {
+      title: best.label || best.original_label || '',
+      year: (best.data && best.data.year) || '',
+      url: pageUrl,
+      press,
+      pressReviews,
+      spectators,
+      votes,
+    };
+  } catch {
+    return (hit && hit.data) || null; // repli : cache périmé plutôt que rien
+  }
+  allocineCache.set(key, { at: now, data });
+  if (allocineCache.size > 500) {
+    const first = allocineCache.keys().next();
+    if (!first.done) allocineCache.delete(first.value);
+  }
+  saveAllocineCache();
+  return data;
+}
+
+ipcMain.handle('allocine:ratings', async (_event, args) => {
+  try {
+    return await allocineRatingsFor(args && args.query, args && args.year);
+  } catch {
+    return null;
+  }
+});
+
 // Déclenchement manuel de la sauvegarde cookies (debug/diagnostic).
 ipcMain.handle('cookies:backup-now', async () => ({ saved: await backupTr4kerCookies(), error: lastCookieBackupError }));
 
@@ -571,6 +727,7 @@ ipcMain.handle('transmission:rpc', async (_event, args) => {
 app.whenReady().then(async () => {
   // Restaure la session AVANT d'ouvrir la moindre fenêtre.
   await restoreTr4kerCookies().catch(() => {});
+  loadAllocineCache();
   createWindow();
   // Sauvegarde périodique (couvre aussi les kills brutaux).
   setInterval(() => {

@@ -199,3 +199,155 @@ html.ion-palette-dark .torrent-iframe {
   border-radius: 10px;
   background: var(--app-border);
 }
+
+/* ---------- Fiche détail Plex (agrandie, actions fixes) ---------- */
+@media (min-width: 720px) {
+  ion-modal.detail-modal {
+    --width: 80%;
+    --height: 92%;
+    --border-radius: 24px;
+  }
+}
+
+.detail-sheet {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 28px 28px 16px;
+}
+
+.detail-top {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+  align-items: start;
+  margin-bottom: 8px;
+}
+
+@media (min-width: 720px) {
+  .detail-top {
+    grid-template-columns: 300px 1fr;
+  }
+}
+
+.detail-poster {
+  width: 100%;
+  max-height: 560px;
+  border-radius: 20px;
+  box-shadow: var(--app-shadow);
+}
+
+.detail-title {
+  font-size: 2.1rem;
+  line-height: 1.2;
+  margin: 4px 0 12px;
+  letter-spacing: -0.01em;
+}
+
+.detail-badge {
+  font-size: 0.95rem;
+  padding: 8px 16px;
+}
+
+.detail-meta p {
+  margin: 6px 0;
+  font-size: 1.05rem;
+  color: var(--ion-color-medium);
+}
+
+.detail-sheet h3 {
+  font-size: 1.35rem;
+  margin: 22px 0 10px;
+}
+
+.detail-summary {
+  font-size: 1.12rem;
+  line-height: 1.7;
+}
+
+.ratings-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 1.05rem;
+  margin: 10px 0;
+}
+
+.ratings-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+  align-items: flex-start;
+}
+
+.ratings-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.05rem;
+}
+
+.ratings-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.85rem;
+  margin: 2px 0 4px;
+}
+
+/* Étoiles façon Allociné : fond vide + premier plan rogné au % */
+.rating-stars {
+  position: relative;
+  display: inline-block;
+  line-height: 1;
+}
+
+.rating-stars .rs-bg,
+.rating-stars .rs-fg {
+  display: inline-flex;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+.rating-stars .rs-bg {
+  color: var(--ion-color-medium);
+  opacity: 0.55;
+}
+
+.rating-stars .rs-fg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: hidden;
+  color: #f5a623;
+}
+
+html.ion-palette-dark .rating-stars .rs-fg {
+  color: #ffc531;
+}
+
+.detail-sheet ion-item {
+  --min-height: 62px;
+  font-size: 1.05rem;
+}
+
+.detail-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  padding: 6px 10px 4px;
+}
+
+.detail-actions ion-button {
+  min-height: 52px;
+  font-size: 1.05rem;
+}
+
+@media (min-width: 560px) {
+  .detail-actions {
+    grid-template-columns: 1fr 1fr;
+    max-width: 780px;
+    margin: 0 auto;
+  }
+}

@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   IonPage,
   IonHeader,
@@ -16,6 +16,7 @@ import { arrowBackOutline, arrowForwardOutline, refreshOutline, shareOutline, op
 import { Browser } from '@capacitor/browser';
 import { Share } from '@capacitor/share';
 import { ALLOCINE_URL } from '../config/appConfig';
+import { consumePendingBrowserUrl, subscribeBrowserOpen } from '../services/browserNavigation';
 
 const BrowserTab: React.FC = () => {
   const [url, setUrl] = useState(ALLOCINE_URL);
@@ -24,6 +25,7 @@ const BrowserTab: React.FC = () => {
   const history = useRef<string[]>([ALLOCINE_URL]);
   const index = useRef(0);
   const [reloadKey, setReloadKey] = useState(0);
+  const navigateRef = useRef<(u: string) => void>(() => {});
 
   function navigate(next: string) {
     let normalized = next.trim();
@@ -54,6 +56,15 @@ const BrowserTab: React.FC = () => {
       setCanGo({ back: true, forward: index.current < history.current.length - 1 });
     }
   }
+
+  navigateRef.current = navigate;
+
+  // Ouvertures demandées depuis d'autres onglets (ex: fiche film -> Allociné).
+  useEffect(() => {
+    const pending = consumePendingBrowserUrl();
+    if (pending) navigateRef.current(pending);
+    return subscribeBrowserOpen((u) => navigateRef.current(u));
+  }, []);
 
   return (
     <IonPage>

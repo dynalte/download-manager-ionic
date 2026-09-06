@@ -12,7 +12,8 @@
     "cap:sync": "npx cap sync",
     "electron:dev": "concurrently -k \"vite --port 8100\" \"wait-on http://localhost:8100 && electron .\"",
     "electron:preview": "npm run build && electron .",
-    "dist:win": "npm run build && electron-builder --win"
+    "dist:win": "npm run build && electron-builder --win",
+    "icons": "node scripts/make-icons.cjs"
   },
   "dependencies": {
     "@capacitor/app": "^7.0.1",
@@ -38,6 +39,8 @@
     "concurrently": "^10.0.5",
     "electron": "^44.2.0",
     "electron-builder": "^26.15.3",
+    "png-to-ico": "^3.0.2",
+    "sharp": "^0.35.4",
     "typescript": "^5.6.3",
     "vite": "^6.0.3",
     "wait-on": "^9.1.0"
@@ -54,7 +57,14 @@
       "electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets"
+      }
+    ],
     "win": {
+      "icon": "assets/icon.ico",
       "target": [
         "nsis"
       ]

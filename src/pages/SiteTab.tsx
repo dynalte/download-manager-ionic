@@ -20,6 +20,7 @@ import {
 import { openOutline, downloadOutline, magnetOutline, filmOutline, phonePortraitOutline } from 'ionicons/icons';
 import { Browser } from '@capacitor/browser';
 import { Capacitor } from '@capacitor/core';
+import { useHistory } from 'react-router-dom';
 import { TR4KER_URL } from '../config/appConfig';
 import { transmissionPath, type DestinationFolder } from '../services/settings';
 import { autoConfirmedFolder, type PendingPayload } from '../services/destinationPredictor';
@@ -33,8 +34,10 @@ import {
   handleGuestTorrentMessage,
 } from '../services/embeddedBrowser';
 import FolderSheet from '../components/FolderSheet';
+import { requestBrowserOpen } from '../services/browserNavigation';
 
 const SiteTab: React.FC = () => {
+  const history = useHistory();
   const [statusMessage, setStatusMessage] = useState('Pret');
   const [errorMessage, setErrorMessage] = useState('');
   const [pending, setPending] = useState<PendingPayload | null>(null);
@@ -133,6 +136,24 @@ const SiteTab: React.FC = () => {
     }
   }
 
+  /** Ouvre la fiche Allociné d'un titre : onglet Navigateur sur exe, système ailleurs. */
+  function openAllocineForTitle(title: string) {
+    const t = (title || '').trim();
+    if (!t) return;
+    const url = buildAllocineUrl(t);
+    if (isElectron) {
+      // Allociné autorise l'iframe : on l'affiche dans l'onglet Navigateur.
+      // Referme la fenêtre TR4KER dédiée si c'est elle qui a émis (sinon invisible derrière).
+      if (browserRef.current) void browserRef.current.close().catch(() => {});
+      requestBrowserOpen(url);
+      history.push('/browser');
+    } else if (Capacitor.isNativePlatform()) {
+      void Browser.open({ url });
+    } else {
+      window.open(url, '_blank', 'noopener');
+    }
+  }
+
   /** Ouvre TR4KER dans une WebView native plein écran (pas d'iframe -> pas de blocage). */
   async function openEmbedded() {
     if (browserBusy) return;
@@ -187,6 +208,11 @@ const SiteTab: React.FC = () => {
         },
         onClose: () => {
           browserRef.current = null;
+        },
+        // Bouton Allociné injecté sur les fiches : ne referme rien, ouvre à côté.
+        onAllocine: (title) => {
+          setToast('Fiche Allociné');
+          openAllocineForTitle(title);
         },
       });
       if (!Capacitor.isNativePlatform()) {
@@ -250,6 +276,10 @@ const SiteTab: React.FC = () => {
         setErrorMessage(err instanceof Error ? err.message : String(err));
       }
     };
+    const submitAllocine = (title: string) => {
+      setToast('Fiche Allociné');
+      openAllocineForTitle(title);
+    };
     const downloadViaGuest = (url: string) => {
       // Téléchargement avec les cookies de la session invité -> will-download (main).
       try {
@@ -265,6 +295,7 @@ const SiteTab: React.FC = () => {
         onTorrentBytes: (t) => submitTorrentBytes(t),
         // Échec du fetch intra-page : retente via la session invité.
         onTorrentUrl: (url) => downloadViaGuest(url),
+        onAllocine: (title) => submitAllocine(title),
         onClose: () => {},
       });
     };
@@ -281,6 +312,7 @@ const SiteTab: React.FC = () => {
       }),
     );
     const offUrl = window.desktop!.onTr4kerTorrentUrl((p) => downloadViaGuest(p.url));
+    const offAllocine = window.desktop!.onTr4kerAllocine((p) => submitAllocine(p.title));
     const onDomReady = () => {
       try {
         const id = wv.getWebContentsId();
@@ -337,6 +369,7 @@ const SiteTab: React.FC = () => {
         offMagnet();
         offBytes();
         offUrl();
+        offAllocine();
       } catch {
         /* ignore */
       }

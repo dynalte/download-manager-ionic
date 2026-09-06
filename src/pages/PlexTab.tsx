@@ -21,7 +21,8 @@ import {
   IonRefresherContent,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline } from 'ionicons/icons';
+import { useHistory } from 'react-router-dom';
 import {
   fetchLibrariesData,
   fetchPlayers,
@@ -35,6 +36,8 @@ import {
   type PlexSeasonItem,
 } from '../services/plex';
 import { settings, Keys } from '../services/settings';
+import { buildAllocineUrl } from '../services/torrentScripts';
+import { requestBrowserOpen } from '../services/browserNavigation';
 import SettingsModal from '../components/SettingsModal';
 import PlayerPicker from '../components/PlayerPicker';
 
@@ -47,6 +50,7 @@ function getStored(key: string, fallback: string): string {
 }
 
 const PlexTab: React.FC = () => {
+  const history = useHistory();
   const [libraries, setLibraries] = useState<PlexLibraryData[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -359,6 +363,19 @@ const PlexTab: React.FC = () => {
                 <IonButton expand="block" onClick={() => void preparePlayback(detail)}>
                   <IonIcon icon={playOutline} slot="start" />
                   Lire sur Plex
+                </IonButton>
+                <IonButton
+                  expand="block"
+                  fill="outline"
+                  style={{ marginTop: 8 }}
+                  onClick={() => {
+                    requestBrowserOpen(buildAllocineUrl(detail.title));
+                    setDetail(null);
+                    history.push('/browser');
+                  }}
+                >
+                  <IonIcon icon={filmOutline} slot="start" />
+                  Voir sur Allociné
                 </IonButton>
               </div>
             )}

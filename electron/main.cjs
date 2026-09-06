@@ -7,13 +7,26 @@
 // session conservés) et renvoyés à la fenêtre principale via IPC.
 // La fenêtre TR4KER ne reçoit AUCUN preload : la page distante n'a accès
 // à aucun bridge privilégié.
-const { app, BrowserWindow, shell, ipcMain, net, webContents } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, net, webContents, session } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
 const isDev = !app.isPackaged;
 const DEV_URL = process.env.ELECTRON_DEV_URL || 'http://localhost:8100';
 const TR4KER_URL = 'https://tr4ker.net/';
+
+/** Icône des fenêtres : assets/ en dev, extraResources en packagé. */
+function windowIcon() {
+  const p = isDev
+    ? path.join(__dirname, '..', 'assets', 'icon.png')
+    : path.join(process.resourcesPath, 'assets', 'icon.png');
+  try {
+    if (fs.existsSync(p)) return p;
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
 const SENTINEL_SCHEME = 'x-tr4ker-intercept://';
 const MAX_TORRENT_BYTES = 20 * 1024 * 1024;
 
@@ -96,7 +109,7 @@ function handleTorrentUrl(url, pageURL) {
     .catch(() => forwardTorrentUrl(url, pageURL)); // l'app retentera en fetch direct
 }
 
-/** Capte un magnet: via une navigation sentinelle émise par le script injecté. */
+/** Capte magnet: et demandes Allociné via navigations sentinelles émises par le script injecté. */
 function handleSentinel(url) {
   try {
     const u = new URL(url);
@@ -108,6 +121,14 @@ function handleSentinel(url) {
         return true;
       }
     }
+    if (u.host === 'allocine') {
+      const title = u.searchParams.get('t') || '';
+      const pageURL = u.searchParams.get('p') || '';
+      if (title) {
+        sendToApp('tr4ker:allocine', { title, pageURL });
+        return true;
+      }
+    }
   } catch {
     /* URL sentinelle malformée : ignore */
   }
@@ -115,7 +136,8 @@ function handleSentinel(url) {
 }
 
 // Script injecté (depuis le processus main, pas de preload dans l'invité) :
-// convertit les clics magnet: en navigation sentinelle interceptable.
+// convertit les clics magnet: en navigation sentinelle interceptable et
+// ajoute un bouton "Allociné" sur les fiches /torrent/<slug> (sentinelle).
 // Les .torrent directs et les téléchargements sont captés côté main
 // (will-navigate / will-download), avec les cookies de session.
 const GUEST_INTERCEPTOR_JS = `
@@ -133,6 +155,50 @@ const GUEST_INTERCEPTOR_JS = `
         + encodeURIComponent(href) + '&p=' + encodeURIComponent(window.location.href);
     }
   }, true);
+  function detailTitle() {
+    let path = '';
+    try { path = window.location.pathname || ''; } catch (e) {}
+    if (path.toLowerCase().indexOf('/torrent/') === -1) return '';
+    let h1s = [];
+    try { h1s = document.querySelectorAll('h1'); } catch (e2) {}
+    for (let i = 0; i < h1s.length; i++) {
+      let t = '';
+      try { t = (h1s[i].textContent || '').trim(); } catch (e3) {}
+      if (t && t.length > 3 && t.toLowerCase() !== 'tr4ker') return t;
+    }
+    return '';
+  }
+  function refreshBtn() {
+    let old = null;
+    try { old = document.getElementById('__tr4kerAllocineBtn'); } catch (e4) {}
+    const title = detailTitle();
+    if (!title) { if (old && old.remove) { try { old.remove(); } catch (e5) {} } return; }
+    if (old) { try { old.setAttribute('data-title', title); } catch (e6) {} return; }
+    try {
+      const b = document.createElement('button');
+      b.id = '__tr4kerAllocineBtn';
+      b.type = 'button';
+      b.textContent = 'Allociné';
+      b.setAttribute('data-title', title);
+      b.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483647;padding:10px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.25);background:#4f46e5;color:#fff;font:600 14px system-ui,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45);';
+      b.addEventListener('click', (ev2) => {
+        try { ev2.preventDefault(); ev2.stopPropagation(); } catch (e7) {}
+        let t = '';
+        try { t = b.getAttribute('data-title') || ''; } catch (e8) {}
+        window.location.href = 'x-tr4ker-intercept://allocine?t='
+          + encodeURIComponent(t) + '&p=' + encodeURIComponent(window.location.href);
+      });
+      document.body.appendChild(b);
+    } catch (e9) {}
+  }
+  try { refreshBtn(); } catch (e10) {}
+  try {
+    let t = null;
+    new MutationObserver(() => {
+      if (t) return;
+      t = setTimeout(() => { t = null; try { refreshBtn(); } catch (e11) {} }, 800);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e12) {}
 })();
 `;
 
@@ -152,9 +218,12 @@ function openTr4kerWindow(url) {
     minWidth: 900,
     minHeight: 600,
     title: 'TR4KER',
+    icon: windowIcon(),
     autoHideMenuBar: true,
     // Pas de preload : aucun bridge exposé à la page distante.
-    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+    // Partition partagée avec la <webview> inline (persist:tr4ker) : UNE seule
+    // session TR4KER pour toute l'app, conservée entre les redémarrages.
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, partition: 'persist:tr4ker' },
   });
   const wc = tr4kerWin.webContents;
 
@@ -248,6 +317,129 @@ function ensureGuestDownloadHook(ses) {
   });
 }
 
+// --- Persistance explicite des cookies TR4KER ---
+// Constat : dans cette app, Chromium ne flushe jamais les cookies sur disque
+// (aucun fichier Cookies créé) -> la session TR4KER meurt à chaque redémarrage.
+// On sauvegarde/restaure donc nous-mêmes les cookies tr4ker.net en JSON.
+const TR4KER_COOKIE_BACKUP = 'tr4ker-cookies.json';
+const TR4KER_COOKIE_HOSTS = ['tr4ker.net'];
+const TR4KER_PARTITION = 'persist:tr4ker';
+
+function tr4kerCookieFile() {
+  try {
+    return path.join(app.getPath('userData'), TR4KER_COOKIE_BACKUP);
+  } catch {
+    return null;
+  }
+}
+
+function isTr4kerCookie(c) {
+  const dom = String(c.domain || '').toLowerCase().replace(/^\./, '');
+  return TR4KER_COOKIE_HOSTS.some((h) => dom === h || dom.endsWith(`.${h}`));
+}
+
+function tr4kerSessions() {
+  const out = [];
+  try {
+    out.push(session.defaultSession);
+  } catch {
+    /* ignore */
+  }
+  try {
+    out.push(session.fromPartition(TR4KER_PARTITION));
+  } catch {
+    /* ignore */
+  }
+  return [...new Set(out)];
+}
+
+/** Dernier message d'erreur du backup cookies (diagnostic via IPC). */
+let lastCookieBackupError = '';
+
+async function backupTr4kerCookies() {
+  const file = tr4kerCookieFile();
+  if (!file) return 0;
+  let saved = 0;
+  try {
+    const seen = new Map();
+    for (const ses of tr4kerSessions()) {
+      let list = [];
+      try {
+        list = await ses.cookies.get({});
+      } catch {
+        continue;
+      }
+      for (const c of list) {
+        if (!isTr4kerCookie(c)) continue;
+        seen.set(`${c.domain}|${c.path}|${c.name}`, {
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || '/',
+          secure: !!c.secure,
+          httpOnly: !!c.httpOnly,
+          sameSite: c.sameSite || 'lax',
+          expirationDate: typeof c.expirationDate === 'number' ? c.expirationDate : undefined,
+        });
+      }
+    }
+    fs.writeFileSync(file, JSON.stringify({ v: 1, at: Date.now(), cookies: [...seen.values()] }), 'utf8');
+    saved = seen.size;
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    console.warn('[cookies] backup impossible:', msg);
+    lastCookieBackupError = msg;
+    return 0;
+  }
+  if (saved > 0) console.info(`[cookies] ${saved} cookie(s) TR4KER sauvegardé(s)`);
+  lastCookieBackupError = '';
+  return saved;
+}
+
+async function restoreTr4kerCookies() {
+  const file = tr4kerCookieFile();
+  if (!file) return 0;
+  let data = null;
+  try {
+    data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return 0; // pas de sauvegarde : premier lancement
+  }
+  const cookies = Array.isArray(data.cookies) ? data.cookies : [];
+  let restored = 0;
+  for (const ses of tr4kerSessions()) {
+    for (const c of cookies) {
+      try {
+        const details = {
+          url: 'https://tr4ker.net/',
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || '/',
+          secure: !!c.secure,
+          sameSite: c.sameSite || 'lax',
+        };
+        if (c.httpOnly) details.httpOnly = true;
+        if (typeof c.expirationDate === 'number' && c.expirationDate > Date.now() / 1000) {
+          details.expirationDate = c.expirationDate;
+        }
+        // Idempotent : évite l'accumulation de doublons à chaque lancement.
+        try {
+          await ses.cookies.remove('https://tr4ker.net/', c.name);
+        } catch {
+          /* ignore */
+        }
+        await ses.cookies.set(details);
+        restored += 1;
+      } catch {
+        /* cookie refusé : ignore */
+      }
+    }
+  }
+  if (restored > 0) console.info(`[cookies] ${restored} cookie(s) TR4KER restauré(s)`);
+  return restored;
+}
+
 function createWindow() {
   mainWin = new BrowserWindow({
     width: 1200,
@@ -255,6 +447,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     title: 'Download Manager',
+    icon: windowIcon(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -298,6 +491,9 @@ ipcMain.handle('tr4ker:close', () => {
   if (tr4kerWin && !tr4kerWin.isDestroyed()) tr4kerWin.close();
   return { closed: true };
 });
+
+// Déclenchement manuel de la sauvegarde cookies (debug/diagnostic).
+ipcMain.handle('cookies:backup-now', async () => ({ saved: await backupTr4kerCookies(), error: lastCookieBackupError }));
 
 // Chemin du preload minimal injecté dans la <webview> TR4KER inline
 // (résolu côté main car différent entre dev et asar packagé).
@@ -372,11 +568,22 @@ ipcMain.handle('transmission:rpc', async (_event, args) => {
   }
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Restaure la session AVANT d'ouvrir la moindre fenêtre.
+  await restoreTr4kerCookies().catch(() => {});
   createWindow();
+  // Sauvegarde périodique (couvre aussi les kills brutaux).
+  setInterval(() => {
+    void backupTr4kerCookies().catch(() => {});
+  }, 30000);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  // Best-effort synchrone impossible (API async) : la sauvegarde périodique couvre.
+  void backupTr4kerCookies().catch(() => {});
 });
 
 app.on('window-all-closed', () => {

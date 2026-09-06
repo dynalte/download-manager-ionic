@@ -16,6 +16,11 @@ export interface DesktopTr4kerTorrentUrl {
   pageURL: string;
 }
 
+export interface DesktopTr4kerAllocine {
+  title: string;
+  pageURL: string;
+}
+
 export interface DesktopBridge {
   platform: string;
   isElectron: boolean;
@@ -24,6 +29,7 @@ export interface DesktopBridge {
   onTr4kerMagnet: (cb: (p: DesktopTr4kerMagnet) => void) => () => void;
   onTr4kerTorrentBytes: (cb: (p: DesktopTr4kerTorrentBytes) => void) => () => void;
   onTr4kerTorrentUrl: (cb: (p: DesktopTr4kerTorrentUrl) => void) => () => void;
+  onTr4kerAllocine: (cb: (p: DesktopTr4kerAllocine) => void) => () => void;
   onTr4kerClosed: (cb: () => void) => () => void;
   /** Chemin du preload minimal de la <webview> TR4KER inline. */
   getTr4kerPreloadPath: () => Promise<string>;
@@ -36,6 +42,8 @@ export interface DesktopBridge {
     password: string;
     payload: Record<string, unknown>;
   }) => Promise<Record<string, unknown>>;
+  /** Sauvegarde immédiate des cookies TR4KER (diagnostic). */
+  cookiesBackupNow: () => Promise<{ saved: number }>;
 }
 
 /** Message posté par le script invité TR4KER (page distante). */

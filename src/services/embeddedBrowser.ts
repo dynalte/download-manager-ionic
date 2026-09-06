@@ -31,6 +31,8 @@ export interface EmbeddedCallbacks {
   onTorrentBytes: (t: EmbeddedTorrentBytes) => void;
   /** URL .torrent dont le téléchargement direct a échoué côté page : l'app retentera en fetch direct. */
   onTorrentUrl: (url: string, pageURL: string) => void;
+  /** Bouton Allociné injecté sur les fiches /torrent/<slug>. */
+  onAllocine?: (title: string, pageURL: string) => void;
   onClose?: () => void;
 }
 
@@ -64,6 +66,9 @@ function fileNameFromUrl(url: string): string {
  *     détachées blob: (pattern exact du site), sniff bencode, rejoue le
  *     clic d'origine si ce n'est pas un torrent ;
  *  3. côté natif : will-navigate / will-download (session invité).
++ *  4. bouton "Allociné" flottant sur les fiches /torrent/<slug>
++ *     (titre h1, suivi des navigations SPA) -> {type:'tr4ker-allocine'}.
+  * Le fetch se fait DANS la page : cookies/session TR4KER conservés.
  * Le fetch se fait DANS la page : cookies/session TR4KER conservés.
  * Ré-entrant (gardes __tr4ker*) car réinjecté à chaque navigation SPA.
  *
@@ -244,6 +249,82 @@ function buildTr4kerGuestInterceptor(postLine: string): string {
       };
     }
   } catch (e8) {}
+
+  // Bouton "Allociné" flottant sur les fiches /torrent/<slug>.
+  function tr4kerDetailTitle() {
+    var path = '';
+    try { path = window.location.pathname || ''; } catch (e20) {}
+    if (path.toLowerCase().indexOf('/torrent/') === -1) return '';
+    var h1s = [];
+    try { h1s = document.querySelectorAll('h1'); } catch (e21) {}
+    for (var i = 0; i < h1s.length; i++) {
+      var t = '';
+      try { t = (h1s[i].textContent || '').trim(); } catch (e22) {}
+      if (t && t.length > 3 && t.toLowerCase() !== 'tr4ker') return t;
+    }
+    try {
+      var og = document.querySelector('meta[property="og:title"]');
+      if (og && og.getAttribute) {
+        var c = (og.getAttribute('content') || '').trim();
+        if (c && c.toLowerCase() !== 'tr4ker') return c;
+      }
+    } catch (e23) {}
+    return '';
+  }
+  function refreshAllocineBtn() {
+    var old = null;
+    try { old = document.getElementById('__tr4kerAllocineBtn'); } catch (e24) {}
+    var title = tr4kerDetailTitle();
+    if (!title) {
+      if (old && old.remove) { try { old.remove(); } catch (e25) {} }
+      return;
+    }
+    if (old) { try { old.setAttribute('data-title', title); } catch (e26) {} return; }
+    var b = null;
+    try {
+      b = document.createElement('button');
+      b.id = '__tr4kerAllocineBtn';
+      b.type = 'button';
+      b.textContent = 'Allociné';
+      b.setAttribute('data-title', title);
+      b.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483647;padding:10px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.25);background:#4f46e5;color:#fff;font:600 14px system-ui,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45);';
+      b.addEventListener('click', function (ev) {
+        try { ev.preventDefault(); ev.stopPropagation(); } catch (e27) {}
+        var t = '';
+        try { t = b.getAttribute('data-title') || ''; } catch (e28) {}
+        var pageURL = '';
+        try { pageURL = window.location.href; } catch (e29) {}
+        __post({ type: 'tr4ker-allocine', title: t, pageURL: pageURL });
+      });
+      document.body.appendChild(b);
+    } catch (e30) {}
+  }
+  try {
+    if (!window.__tr4kerHistHooked) {
+      window.__tr4kerHistHooked = true;
+      var __wrapHist = function (fn) {
+        return function () {
+          var r = fn.apply(this, arguments);
+          try { refreshAllocineBtn(); } catch (e31) {}
+          return r;
+        };
+      };
+      try { history.pushState = __wrapHist(history.pushState); } catch (e32) {}
+      try { history.replaceState = __wrapHist(history.replaceState); } catch (e33) {}
+      window.addEventListener('popstate', function () { try { refreshAllocineBtn(); } catch (e34) {} });
+    }
+  } catch (e35) {}
+  try {
+    var __allocTimer = null;
+    new MutationObserver(function () {
+      if (__allocTimer) return;
+      __allocTimer = setTimeout(function () {
+        __allocTimer = null;
+        try { refreshAllocineBtn(); } catch (e36) {}
+      }, 800);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e37) {}
+  try { refreshAllocineBtn(); } catch (e38) {}
 })();
 `;
 }
@@ -277,11 +358,13 @@ export async function openTr4kerEmbedded(
       }),
     );
     const offUrl = desktop.onTr4kerTorrentUrl((p) => cb.onTorrentUrl(p.url, p.pageURL || ''));
+    const offAllocine = desktop.onTr4kerAllocine((p) => cb.onAllocine?.(p.title, p.pageURL || ''));
     const offClosed = desktop.onTr4kerClosed(() => cb.onClose?.());
     const cleanup = () => {
       offMagnet();
       offBytes();
       offUrl();
+      offAllocine();
       offClosed();
     };
     await desktop.openTr4ker(siteURL);
@@ -328,6 +411,8 @@ export async function openTr4kerEmbedded(
       });
     } else if (d['type'] === 'tr4ker-torrent-url' && typeof d['url'] === 'string') {
       cb.onTorrentUrl(d['url'], typeof d['pageURL'] === 'string' ? d['pageURL'] : '');
+    } else if (d['type'] === 'tr4ker-allocine' && typeof d['title'] === 'string') {
+      cb.onAllocine?.(d['title'], typeof d['pageURL'] === 'string' ? d['pageURL'] : '');
     }
   });
 
@@ -406,6 +491,10 @@ export function handleGuestTorrentMessage(msg: unknown, cb: EmbeddedCallbacks): 
   if (d['type'] === 'tr4ker-torrent-url' && typeof d['url'] === 'string') {
     cb.onTorrentUrl(d['url'], typeof d['pageURL'] === 'string' ? d['pageURL'] : '');
     return 'torrent-url';
+  }
+  if (d['type'] === 'tr4ker-allocine' && typeof d['title'] === 'string') {
+    cb.onAllocine?.(d['title'], typeof d['pageURL'] === 'string' ? d['pageURL'] : '');
+    return 'handled';
   }
   return 'ignored';
 }

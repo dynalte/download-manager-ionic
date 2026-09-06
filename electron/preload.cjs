@@ -22,8 +22,10 @@ contextBridge.exposeInMainWorld('desktop', {
   onTr4kerMagnet: (cb) => subscribe('tr4ker:magnet', cb),
   onTr4kerTorrentBytes: (cb) => subscribe('tr4ker:torrent-bytes', cb),
   onTr4kerTorrentUrl: (cb) => subscribe('tr4ker:torrent-url', cb),
+  onTr4kerAllocine: (cb) => subscribe('tr4ker:allocine', cb),
   onTr4kerClosed: (cb) => subscribe('tr4ker:closed', cb),
   getTr4kerPreloadPath: () => ipcRenderer.invoke('tr4ker:preload-path'),
   attachTr4kerDownloads: (contentsId) => ipcRenderer.invoke('tr4ker:attach-downloads', contentsId),
   transmissionRpc: (args) => ipcRenderer.invoke('transmission:rpc', args),
+  cookiesBackupNow: () => ipcRenderer.invoke('cookies:backup-now'),
 });

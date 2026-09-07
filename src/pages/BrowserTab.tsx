@@ -10,7 +10,6 @@ import {
   IonIcon,
   IonItem,
   IonInput,
-  IonText,
 } from '@ionic/react';
 import { arrowBackOutline, arrowForwardOutline, refreshOutline, shareOutline, openOutline } from 'ionicons/icons';
 import { Browser } from '@capacitor/browser';
@@ -99,18 +98,6 @@ const BrowserTab: React.FC = () => {
               Ouvrir
             </IonButton>
           </IonItem>
-          <div style={{ padding: '0 12px 6px' }}>
-            <IonText color="medium">
-              <small style={{ wordBreak: 'break-all' }}>{url || 'Aucune page chargee'}</small>
-            </IonText>
-            <IonText color="medium">
-              <small>
-                Si la page affiche &quot;n&apos;autorise pas la connexion&quot;, le site refuse l&apos;affichage
-                embarqué (X-Frame-Options / CSP). Utilise le bouton Ouvrir pour le voir dans le
-                navigateur système.
-              </small>
-            </IonText>
-          </div>
         </IonToolbar>
       </IonHeader>
       <IonContent fullscreen>

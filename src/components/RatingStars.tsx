@@ -1,6 +1,6 @@
 import React from 'react';
 import { IonIcon } from '@ionic/react';
-import { star, starOutline } from 'ionicons/icons';
+import { star } from 'ionicons/icons';
 
 interface Props {
   /** Note sur 5 (ex: 4,2). */
@@ -8,21 +8,24 @@ interface Props {
   size?: number;
 }
 
-/** 5 étoiles avec remplissage fractionnaire (façon Allociné). */
+/** 5 étoiles avec remplissage fractionnaire (façon Allociné).
+    Rognage par étoile (pas par rangée) : aucun décalage cumulé possible,
+    chaque étoile jaune est calée sur sa jumelle grise. */
 const RatingStars: React.FC<Props> = ({ value, size = 18 }) => {
-  const pct = Math.max(0, Math.min(100, (value / 5) * 100));
+  const v = Math.max(0, Math.min(5, value));
   return (
     <span className="rating-stars" style={{ fontSize: size }} aria-label={`${value}/5`}>
-      <span className="rs-bg">
-        {[0, 1, 2, 3, 4].map((i) => (
-          <IonIcon key={i} icon={starOutline} />
-        ))}
-      </span>
-      <span className="rs-fg" style={{ width: `${pct}%` }}>
-        {[0, 1, 2, 3, 4].map((i) => (
-          <IonIcon key={i} icon={star} />
-        ))}
-      </span>
+      {[0, 1, 2, 3, 4].map((i) => {
+        const fill = Math.max(0, Math.min(1, v - i));
+        return (
+          <span key={i} className="rs-one">
+            <IonIcon icon={star} className="rs-one-bg" />
+            <span className="rs-one-fg" style={{ width: `${fill * 100}%` }}>
+              <IonIcon icon={star} />
+            </span>
+          </span>
+        );
+      })}
     </span>
   );
 };

@@ -8,6 +8,10 @@ export const AppConfig = {
   plexBaseURL: 'http://photos2.dynaspirit.com:32400',
   plexToken: '',
   plexUseCloudDefault: false,
+  fileServerBaseURL: 'http://photos2.dynaspirit.com:8080',
+  fileServerUsername: 'vr',
+  fileServerPassword: 'lavrcestbien',
+  tr4kerApiKey: '',
 } as const;
 
 export const TR4KER_URL = 'https://tr4ker.net/';

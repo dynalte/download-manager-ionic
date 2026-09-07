@@ -250,6 +250,44 @@ function buildTr4kerGuestInterceptor(postLine: string): string {
     }
   } catch (e8) {}
 
+  // Attrape les clics synthétiques (dispatchEvent MouseEvent) sur ancres,
+  // variante du pattern précédent que ni le listener document (ancre hors
+  // DOM : pas de propagation) ni le patch .click() ne voient. Sans ce
+  // filet, la WebView navigue vers l'URL blob: et affiche le binaire.
+  try {
+    var protoD = window.HTMLAnchorElement && window.HTMLAnchorElement.prototype;
+    if (protoD && !protoD.__tr4kerDispatchPatched) {
+      protoD.__tr4kerDispatchPatched = true;
+      var origDispatch = protoD.dispatchEvent;
+      protoD.dispatchEvent = function (ev) {
+        var anchorD = this;
+        try {
+          if (!window.__tr4kerRelaying && ev && (ev.type === 'click' || ev.type === 'auxclick')) {
+            var href3 = anchorD.href || '';
+            var hl3 = href3.toLowerCase();
+            if (href3 && hl3.indexOf('magnet:') === 0) {
+              try { ev.preventDefault(); } catch (e9) {}
+              __post({ type: 'tr4ker-magnet', url: href3, pageURL: window.location.href });
+              return false;
+            }
+            if (href3 && hl3.indexOf('blob:') === 0) {
+              try { ev.preventDefault(); } catch (e10) {}
+              var dl3 = '';
+              try { dl3 = anchorD.getAttribute('download') || ''; } catch (e11) {}
+              handleBlob(href3, dl3, '', function (h, d) {
+                window.__tr4kerRelaying = true;
+                try { origDispatch.call(anchorD, ev); } catch (e12) {}
+                window.__tr4kerRelaying = false;
+              });
+              return false;
+            }
+          }
+        } catch (e13) {}
+        return origDispatch.apply(this, arguments);
+      };
+    }
+  } catch (e14) {}
+
   // Bouton "Allociné" flottant sur les fiches /torrent/<slug>.
   function tr4kerDetailTitle() {
     var path = '';

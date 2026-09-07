@@ -22,14 +22,17 @@ import {
   IonFooter,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline } from 'ionicons/icons';
+import { Capacitor } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import {
   fetchLibrariesData,
-  fetchPlayers,
+  fetchPlayersDetailed,
   fetchSeasonEpisodes,
   fetchShowSeasons,
   playOnPlayer,
+  probeAndAddManualPlayer,
+  removeManualPlayer as removeManualPlayerEntry,
   type PlexEpisodeItem,
   type PlexLibraryData,
   type PlexLibraryItem,
@@ -37,8 +40,9 @@ import {
   type PlexSeasonItem,
 } from '../services/plex';
 import { settings, Keys } from '../services/settings';
-import { buildAllocineUrl } from '../services/torrentScripts';
+import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
+import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { isDesktopElectron } from '../services/embeddedBrowser';
 import SettingsModal from '../components/SettingsModal';
@@ -64,8 +68,11 @@ const PlexTab: React.FC = () => {
   const [watchFilter, setWatchFilter] = useState<WatchFilter>((getStored(Keys.plexWatchFilter, 'all') as WatchFilter) || 'all');
   const [displayMode, setDisplayMode] = useState<DisplayMode>((getStored(Keys.plexDisplayMode, 'list') as DisplayMode) || 'list');
   const [players, setPlayers] = useState<PlexPlayerTarget[]>([]);
+  const [playersDebug, setPlayersDebug] = useState('');
+  const [playersDiagnostic, setPlayersDiagnostic] = useState('');
   const [selectedItem, setSelectedItem] = useState<PlexLibraryItem | null>(null);
   const [showPlayerPicker, setShowPlayerPicker] = useState(false);
+  const [loadingPlayers, setLoadingPlayers] = useState(false);
   const [playbackMsg, setPlaybackMsg] = useState('');
   const [detail, setDetail] = useState<PlexLibraryItem | null>(null);
   const [seasons, setSeasons] = useState<PlexSeasonItem[]>([]);
@@ -140,10 +147,10 @@ const PlexTab: React.FC = () => {
     [libraries, mediaFilter, watchFilter],
   );
 
-  // Remplit les notes de la liste/grille en arrière-plan (exe uniquement) :
-  // visibles d'abord, concurrence limitée, cache main de 30 j, silencieux.
+  // Remplit les notes de la liste/grille en arrière-plan (exe + natif) :
+  // visibles d'abord, concurrence limitée, cache de 30 j, silencieux.
   useEffect(() => {
-    if (!isDesktopElectron()) return;
+    if (!isDesktopElectron() && !Capacitor.isNativePlatform()) return;
     const reqId = ++ratingsFillReq.current;
     const seen = new Set<string>();
     const queue: PlexLibraryItem[] = [];
@@ -195,36 +202,77 @@ const PlexTab: React.FC = () => {
 
   async function preparePlayback(item: PlexLibraryItem) {
     setSelectedItem(item);
-    setPlaybackMsg('Recherche des lecteurs Plex...');
+    setLoadingPlayers(true);
+    setPlaybackMsg('Recherche des lecteurs Plex (ouvre l’app Plex sur ta Fire TV si absente)...');
     try {
-      const list = await fetchPlayers(settings.plexResolvedBaseURL, settings.plexToken);
+      const { players: list, debug } = await fetchPlayersDetailed(settings.plexResolvedBaseURL, settings.plexToken);
+      const dbg = `resources ${debug.keptResources}/${debug.rawResources} • clients ${debug.clientsCount} • sessions ${debug.sessionsCount} • serveurs ${debug.servers.length}${debug.errors.length ? ` • erreurs: ${debug.errors.join(' | ')}` : ''}`;
+      setPlayersDebug(dbg);
+      setPlayersDiagnostic(
+        [`compte: ${debug.account || '?'}`, `synthese: ${dbg}`, ...debug.devicesSummary,
+         ...(debug.filteredOut.length ? [`ecartes: ${debug.filteredOut.map((f) => `"${f.name}" [${f.product}] (${f.reason})`).join(', ')}`] : []),
+         ...(debug.errors.length ? [`erreurs: ${debug.errors.join(' | ')}`] : []),
+         `lecteurs finaux: ${list.map((p) => `"${p.name}" [${p.product}/${p.platform}] presence=${p.presence === true ? 'en-ligne' : p.presence === false ? 'hors-ligne' : '?'} source=${p.source}`).join(' ; ') || 'aucun'}`,
+        ].join('\n'),
+      );
       if (list.length === 0) {
-        setPlaybackMsg('Aucun lecteur Plex detecte.');
+        setPlaybackMsg(`Aucun lecteur Plex detecte (${dbg}). Ouvre l’app Plex sur la Fire TV (même compte, même Wi-Fi) puis réessaie.`);
         return;
       }
+      const online = list.filter((p) => p.presence === true).length;
       setPlayers(list);
-      setPlaybackMsg(`Choisis un lecteur pour ${item.title}`);
+      setPlaybackMsg(
+        `${list.length} lecteur(s) (${dbg})${online ? ` dont ${online} en ligne` : ''} — choisis un lecteur « En ligne » pour ${item.title}`,
+      );
       setShowPlayerPicker(true);
-    } catch {
-      setPlaybackMsg('Erreur detection lecteurs Plex.');
+    } catch (e) {
+      setPlaybackMsg(`Erreur detection lecteurs Plex: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLoadingPlayers(false);
     }
   }
 
   async function startPlayback(item: PlexLibraryItem, player: PlexPlayerTarget) {
     try {
-      setPlaybackMsg(`Envoi de la commande vers ${player.name}...`);
+      const label = item.type.toLowerCase() === 'show' ? ' (épisode à lire résolu auto)' : '';
+      setPlaybackMsg(`Envoi de "${item.title}"${label} vers ${player.name}...`);
       await playOnPlayer(item, player, settings.plexResolvedBaseURL, settings.plexToken);
-      setPlaybackMsg(`Commande envoyee a ${player.name}`);
+      setPlaybackMsg(`Commande envoyee a ${player.name} — si rien ne démarre, vérifie que l’app Plex est ouverte sur la TV.`);
     } catch (e) {
       setPlaybackMsg(`Echec lecture sur ${player.name}: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /** Ajout manuel d'une Fire TV par IP (contourne plex.tv). */
+  async function addManualPlayer(host: string, port: string) {
+    setLoadingPlayers(true);
+    setPlaybackMsg(`Sondage de la TV sur ${host}:${port}... (lance une lecture sur la TV si ça échoue)`);
+    try {
+      const added = await probeAndAddManualPlayer(host, port, settings.plexToken);
+      setPlaybackMsg(`TV ajoutée : ${added.name}. Actualisation de la liste...`);
+      if (selectedItem) await preparePlayback(selectedItem);
+      else {
+        const { players: list } = await fetchPlayersDetailed(settings.plexResolvedBaseURL, settings.plexToken);
+        setPlayers(list);
+      }
+    } catch (e) {
+      setPlaybackMsg(`Ajout manuel impossible: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLoadingPlayers(false);
+    }
+  }
+
+  function handleRemoveManual(baseURL: string) {
+    removeManualPlayerEntry(baseURL);
+    setPlayers((prev) => prev.filter((p) => !(p.source.includes('manual') && p.baseURL === baseURL)));
+    setPlaybackMsg('Lecteur manuel retiré.');
   }
 
   async function openDetail(item: PlexLibraryItem) {
     setDetail(item);
     setSeasons([]);
     setRatings(null);
-    // Notes Allociné (exe uniquement, silencieux si indisponible).
+    // Notes Allociné (exe + natif, silencieux si indisponible).
     const reqId = ++ratingsReq.current;
     setRatingsLoading(true);
     void fetchAllocineRatings(item.title, item.year)
@@ -251,8 +299,47 @@ const PlexTab: React.FC = () => {
     }
   }
 
-  async function openSeason(s: PlexSeasonItem) {
-    setSeason(s);
+  /** Abonne la série au suivi auto : baseline = dernier épisode présent dans Plex. */
+  async function subscribeShow(item: PlexLibraryItem) {
+    try {
+      setPlaybackMsg('Analyse des épisodes Plex présents...');
+      const seasons = await fetchShowSeasons(settings.plexResolvedBaseURL, settings.plexToken, item.ratingKey);
+      let maxS = 0;
+      let maxE = 0;
+      for (const s of seasons) {
+        const eps = await fetchSeasonEpisodes(settings.plexResolvedBaseURL, settings.plexToken, s.ratingKey);
+        for (const ep of eps) {
+          const si = ep.seasonIndex ?? s.index ?? 0;
+          const ei = ep.episodeIndex ?? 0;
+          if (si > maxS || (si === maxS && ei > maxE)) {
+            maxS = si;
+            maxE = ei;
+          }
+        }
+      }
+      const query = buildAllocineQuery(item.title) || item.title;
+      const base =
+        maxS > 0 ? `S${String(maxS).padStart(2, '0')}E${String(maxE).padStart(2, '0')}` : 'aucun épisode';
+      upsertSubscription({
+        id: subscriptionIdFor(item.title, item.year),
+        title: item.title,
+        query,
+        year: item.year != null ? String(item.year) : undefined,
+        enabled: true,
+        lastSeason: maxS,
+        lastEpisode: maxE,
+        addedKeys: [],
+        createdAt: Date.now(),
+        lastCheckAt: 0,
+        lastResult: `Base Plex : ${base}`,
+      });
+      setPlaybackMsg(`Suivi activé : ${item.title} (base ${base}). Voir l’onglet Suivis.`);
+    } catch (e) {
+      setPlaybackMsg(`Suivi impossible : ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  async function openSeason(s: PlexSeasonItem) {    setSeason(s);
     setLoadingEpisodes(true);
     try {
       setEpisodes(await fetchSeasonEpisodes(settings.plexResolvedBaseURL, settings.plexToken, s.ratingKey));
@@ -524,6 +611,12 @@ const PlexTab: React.FC = () => {
                   <IonIcon icon={filmOutline} slot="start" />
                   Voir sur Allociné
                 </IonButton>
+                {detail && detail.type.toLowerCase() === 'show' && (
+                  <IonButton expand="block" fill="outline" onClick={() => void subscribeShow(detail)}>
+                    <IonIcon icon={notificationsOutline} slot="start" />
+                    Suivre la série
+                  </IonButton>
+                )}
               </div>
             </IonToolbar>
           </IonFooter>
@@ -583,6 +676,14 @@ const PlexTab: React.FC = () => {
           isOpen={showPlayerPicker}
           title={selectedItem?.title ?? 'Choisir un lecteur'}
           players={players}
+          debug={playersDebug}
+          diagnostic={playersDiagnostic}
+          refreshing={loadingPlayers}
+          onRefresh={() => {
+            if (selectedItem) void preparePlayback(selectedItem);
+          }}
+          onAddManual={(host, port) => void addManualPlayer(host, port)}
+          onRemoveManual={handleRemoveManual}
           onCancel={() => setShowPlayerPicker(false)}
           onSelect={(player) => {
             setShowPlayerPicker(false);

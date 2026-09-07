@@ -296,34 +296,36 @@ html.ion-palette-dark .torrent-iframe {
   margin: 2px 0 4px;
 }
 
-/* Étoiles façon Allociné : fond vide + premier plan rogné au % */
+/* Étoiles façon Allociné : chaque étoile porte son propre remplissage
+   (pas de superposition de rangées -> aucun décalage possible). */
 .rating-stars {
+  display: inline-flex;
+  gap: 2px;
+  line-height: 1;
+}
+
+.rs-one {
   position: relative;
   display: inline-block;
   line-height: 1;
 }
 
-.rating-stars .rs-bg,
-.rating-stars .rs-fg {
-  display: inline-flex;
-  gap: 2px;
-  white-space: nowrap;
-}
-
-.rating-stars .rs-bg {
+.rs-one-bg {
   color: var(--ion-color-medium);
   opacity: 0.55;
 }
 
-.rating-stars .rs-fg {
+.rs-one-fg {
   position: absolute;
   left: 0;
   top: 0;
+  height: 100%;
   overflow: hidden;
+  white-space: nowrap;
   color: #f5a623;
 }
 
-html.ion-palette-dark .rating-stars .rs-fg {
+html.ion-palette-dark .rs-one-fg {
   color: #ffc531;
 }
 
@@ -350,4 +352,13 @@ html.ion-palette-dark .rating-stars .rs-fg {
     max-width: 780px;
     margin: 0 auto;
   }
+}
+
+/* iOS : pas de zoom auto au focus des champs (WebKit zoome sous 16px).
+   Sans ça, la modale Réglages zoome et le bouton Fermer devient inaccessible.
+   Règle posée sur l'hôte (l'input interne hérite via `font-size: inherit`,
+   aucun sélecteur shadow-DOM requis). */
+ion-input,
+ion-textarea {
+  font-size: 16px;
 }

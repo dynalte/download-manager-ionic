@@ -15,6 +15,11 @@ export const Keys = {
   folderFilmsPath: 'transmission_folder_films_path',
   folderSeriesPath: 'transmission_folder_series_path',
   folderMusiquePath: 'transmission_folder_musique_path',
+  folderLivresPath: 'transmission_folder_livres_path',
+  fileServerBaseURL: 'file_server_base_url',
+  fileServerUsername: 'file_server_username',
+  fileServerPassword: 'file_server_password',
+  tr4kerApiKey: 'tr4ker_api_key',
   downloadNotificationsEnabled: 'download_notifications_enabled',
   downloadPollIntervalSeconds: 'download_poll_interval_seconds',
   plexMediaFilter: 'plex_media_filter',
@@ -25,6 +30,7 @@ export const Keys = {
 export const DEFAULT_FOLDER_FILMS = '/downloads/films';
 export const DEFAULT_FOLDER_SERIES = '/downloads/series';
 export const DEFAULT_FOLDER_MUSIQUE = '/downloads/musique';
+export const DEFAULT_FOLDER_LIVRES = '/downloads/livres';
 export const DEFAULT_POLL_INTERVAL = 20;
 
 function getString(key: string, fallback = ''): string {
@@ -51,26 +57,29 @@ function getInt(key: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
-export type DestinationFolder = 'films' | 'series' | 'musique';
+export type DestinationFolder = 'films' | 'series' | 'musique' | 'livres';
 
-export const DESTINATION_FOLDERS: DestinationFolder[] = ['films', 'series', 'musique'];
+export const DESTINATION_FOLDERS: DestinationFolder[] = ['films', 'series', 'musique', 'livres'];
 
 export const folderDisplayName: Record<DestinationFolder, string> = {
   films: 'Films',
   series: 'Séries',
   musique: 'Musique',
+  livres: 'Livres',
 };
 
 export const folderDefaultPath: Record<DestinationFolder, string> = {
   films: DEFAULT_FOLDER_FILMS,
   series: DEFAULT_FOLDER_SERIES,
   musique: DEFAULT_FOLDER_MUSIQUE,
+  livres: DEFAULT_FOLDER_LIVRES,
 };
 
 const folderStorageKey: Record<DestinationFolder, string> = {
   films: Keys.folderFilmsPath,
   series: Keys.folderSeriesPath,
   musique: Keys.folderMusiquePath,
+  livres: Keys.folderLivresPath,
 };
 
 export function transmissionPath(folder: DestinationFolder): string {
@@ -133,6 +142,23 @@ export const settings = {
   },
   get downloadPollIntervalSeconds(): number {
     return getInt(Keys.downloadPollIntervalSeconds, DEFAULT_POLL_INTERVAL);
+  },
+  /** Serveur HTTP des fichiers téléchargés (envoi e-books). */
+  get fileServerBaseURL(): string {
+    const stored = getString(Keys.fileServerBaseURL, '').trim().replace(/\/+$/, '');
+    return stored === '' ? AppConfig.fileServerBaseURL : stored;
+  },
+  get fileServerUsername(): string {
+    const stored = getString(Keys.fileServerUsername, '').trim();
+    return stored === '' ? AppConfig.fileServerUsername : stored;
+  },
+  get fileServerPassword(): string {
+    return getString(Keys.fileServerPassword, AppConfig.fileServerPassword);
+  },
+  /** Clé API TR4KER personnelle (suivi de séries). Vide = suivi désactivé. */
+  get tr4kerApiKey(): string {
+    const stored = getString(Keys.tr4kerApiKey, '').trim();
+    return stored === '' ? AppConfig.tr4kerApiKey : stored;
   },
 };
 

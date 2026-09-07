@@ -23,6 +23,7 @@ import {
   DEFAULT_FOLDER_FILMS,
   DEFAULT_FOLDER_SERIES,
   DEFAULT_FOLDER_MUSIQUE,
+  DEFAULT_FOLDER_LIVRES,
   DEFAULT_POLL_INTERVAL,
   setSetting,
 } from '../services/settings';
@@ -50,6 +51,11 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [filmsPath, setFilmsPath] = useStored(Keys.folderFilmsPath, DEFAULT_FOLDER_FILMS);
   const [seriesPath, setSeriesPath] = useStored(Keys.folderSeriesPath, DEFAULT_FOLDER_SERIES);
   const [musiquePath, setMusiquePath] = useStored(Keys.folderMusiquePath, DEFAULT_FOLDER_MUSIQUE);
+  const [livresPath, setLivresPath] = useStored(Keys.folderLivresPath, DEFAULT_FOLDER_LIVRES);
+  const [fileServerURL, setFileServerURL] = useStored(Keys.fileServerBaseURL, AppConfig.fileServerBaseURL);
+  const [fileServerUser, setFileServerUser] = useStored(Keys.fileServerUsername, AppConfig.fileServerUsername);
+  const [fileServerPass, setFileServerPass] = useStored(Keys.fileServerPassword, AppConfig.fileServerPassword);
+  const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
   const [plexBaseURL, setPlexBaseURL] = useStored(Keys.plexBaseURL, AppConfig.plexBaseURL);
   const [plexToken, setPlexToken] = useStored(Keys.plexToken, AppConfig.plexToken);
   const [plexSectionKeysCSV, setPlexSectionKeysCSV] = useStored(Keys.plexSectionKeysCSV, '');
@@ -81,10 +87,10 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             </IonLabel>
           </IonItem>
           <IonItem>
-            <IonInput label="URL RPC" labelPlacement="stacked" value={rpcURL} onIonInput={(e) => setRpcURL(String(e.detail.value ?? ''))} placeholder="http://IP:9091/transmission/rpc" />
+            <IonInput label="URL RPC" labelPlacement="stacked" value={rpcURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setRpcURL(String(e.detail.value ?? ''))} placeholder="http://IP:9091/transmission/rpc" />
           </IonItem>
           <IonItem>
-            <IonInput label="Nom d'utilisateur" labelPlacement="stacked" value={username} onIonInput={(e) => setUsername(String(e.detail.value ?? ''))} />
+            <IonInput label="Nom d'utilisateur" labelPlacement="stacked" value={username} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setUsername(String(e.detail.value ?? ''))} />
           </IonItem>
           <IonItem>
             <IonInput label="Mot de passe" labelPlacement="stacked" type="password" value={password} onIonInput={(e) => setPassword(String(e.detail.value ?? ''))} />
@@ -105,6 +111,35 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           <IonItem>
             <IonInput label="Musique" labelPlacement="stacked" value={musiquePath} placeholder={DEFAULT_FOLDER_MUSIQUE} onIonInput={(e) => setMusiquePath(String(e.detail.value ?? ''))} />
           </IonItem>
+          <IonItem>
+            <IonInput label="Livres" labelPlacement="stacked" value={livresPath} placeholder={DEFAULT_FOLDER_LIVRES} onIonInput={(e) => setLivresPath(String(e.detail.value ?? ''))} />
+          </IonItem>
+
+          <IonItem>
+            <IonLabel>
+              <h2>Serveur de fichiers</h2>
+              <p>Accès HTTP aux fichiers téléchargés (envoi e-books par e-mail).</p>
+            </IonLabel>
+          </IonItem>
+          <IonItem>
+            <IonInput label="URL de base" labelPlacement="stacked" value={fileServerURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setFileServerURL(String(e.detail.value ?? ''))} placeholder="http://serveur:8080" />
+          </IonItem>
+          <IonItem>
+            <IonInput label="Nom d'utilisateur" labelPlacement="stacked" value={fileServerUser} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setFileServerUser(String(e.detail.value ?? ''))} />
+          </IonItem>
+          <IonItem>
+            <IonInput label="Mot de passe" labelPlacement="stacked" type="password" value={fileServerPass} onIonInput={(e) => setFileServerPass(String(e.detail.value ?? ''))} />
+          </IonItem>
+
+          <IonItem>
+            <IonLabel>
+              <h2>Suivi de séries</h2>
+              <p>Clé API personnelle TR4KER (réglages du compte TR4KER). Sans elle, pas de vérification auto.</p>
+            </IonLabel>
+          </IonItem>
+          <IonItem>
+            <IonInput label="Clé API TR4KER" labelPlacement="stacked" type="password" value={tr4kerApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setTr4kerApiKey(String(e.detail.value ?? ''))} />
+          </IonItem>
 
           <IonItem>
             <IonLabel>
@@ -124,7 +159,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             </IonToggle>
           </IonItem>
           <IonItem>
-            <IonInput label="URL Plex" labelPlacement="stacked" value={plexBaseURL} disabled={plexUseCloud} onIonInput={(e) => setPlexBaseURL(String(e.detail.value ?? ''))} placeholder="http://192.168.1.10:32400" />
+            <IonInput label="URL Plex" labelPlacement="stacked" value={plexBaseURL} disabled={plexUseCloud} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setPlexBaseURL(String(e.detail.value ?? ''))} placeholder="http://192.168.1.10:32400" />
           </IonItem>
           <IonItem>
             <IonInput label="Token Plex" labelPlacement="stacked" type="password" value={plexToken} onIonInput={(e) => setPlexToken(String(e.detail.value ?? ''))} />

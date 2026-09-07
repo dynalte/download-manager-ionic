@@ -35,7 +35,7 @@ export function destinationPrediction(p: PendingPayload): DestinationPrediction 
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
-  const scores: Record<DestinationFolder, number> = { films: 0, series: 0, musique: 0 };
+  const scores: Record<DestinationFolder, number> = { films: 0, series: 0, musique: 0, livres: 0 };
 
   const add = (folder: DestinationFolder, keywords: string[], weight: number) => {
     for (const k of keywords) if (normalized.includes(k)) scores[folder] += weight;
@@ -43,6 +43,7 @@ export function destinationPrediction(p: PendingPayload): DestinationPrediction 
   add('films', ['/films', 'film', 'movie', 'cinema', 'bluray', 'bdrip', 'dvdrip'], 3);
   add('series', ['/series', 'serie', 'season', 'saison', 'episode', 'tv show', 's0', 'e0'], 3);
   add('musique', ['/musique', 'musique', 'music', 'mp3', 'flac', 'album', 'discography'], 3);
+  add('livres', ['/livres', 'livre', 'ebook', 'e-book', 'epub', 'mobi', 'azw', 'pdf', 'book'], 3);
   if (/(1080p|2160p|x264|x265)/.test(normalized)) scores.films += 1;
   if (/(s01|s02|episode)/.test(normalized)) scores.series += 1;
 

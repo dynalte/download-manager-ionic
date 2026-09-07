@@ -495,7 +495,7 @@ ipcMain.handle('tr4ker:close', () => {
 // --- Notes Allociné (automatiques) ---
 // Chaîne : autocomplete public (/_/autocomplete/<q>) -> fiche film/série SSR
 // -> notes presse/spectateurs parsées. Cache JSON 30 j + mémoire (500 entrées).
-const ALLOCINE_FILE = 'allocine-ratings.json';
+const ALLOCINE_FILE = 'allocine-ratings-v2.json';
 const ALLOCINE_TTL = 30 * 24 * 3600 * 1000;
 const allocineCache = new Map();
 
@@ -563,6 +563,50 @@ function parseAllocineVotes(txt) {
   return Number.isFinite(n) ? n : null;
 }
 
+function allocineNorm(s) {
+  return String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// L'autocomplete peut renvoyer en tête une promo sans rapport (ex: un film
+// mis en avant la même année). On score : ressemblance du titre + bonus
+// millésime Plex. Repli : ancien comportement si rien ne ressemble.
+function pickAllocineCandidate(cands, query, year) {
+  const q = allocineNorm(query);
+  const wantYear = year !== undefined && year !== null ? String(year).trim() : '';
+  let best = null;
+  let bestScore = 0;
+  for (const r of cands) {
+    // Score du meilleur libellé (pas de cumul : un titre approché
+    // label + original ne doit pas battre un match exact).
+    const labels = [r && r.label, r && r.original_label].map(allocineNorm).filter(Boolean);
+    let t = 0;
+    for (const n of labels) {
+      let s = 0;
+      if (n === q) s = 100;
+      else if (n.startsWith(q) || q.startsWith(n)) s = 60;
+      else if (n.includes(q) || q.includes(n)) s = 30;
+      if (s > t) t = s;
+    }
+    if (wantYear && r && r.data && String(r.data.year || '') === wantYear) t += 25;
+    if (t > bestScore) {
+      bestScore = t;
+      best = r;
+    }
+  }
+  if (best) return best;
+  best = cands[0];
+  if (wantYear) {
+    const same = cands.find((r) => r.data && String(r.data.year || '') === wantYear);
+    if (same) best = same;
+  }
+  return best;
+}
+
 async function allocineRatingsFor(query, year) {
   const key = `${String(query || '').trim().toLowerCase()}|${String(year ?? '').trim()}`;
   if (key === '|') return null;
@@ -574,13 +618,8 @@ async function allocineRatingsFor(query, year) {
     const ac = JSON.parse(await allocineGetText(`https://www.allocine.fr/_/autocomplete/${encodeURIComponent(query.trim())}`, 12000));
     const cands = ((ac && ac.results) || []).filter((r) => r && (r.entity_type === 'movie' || r.entity_type === 'series'));
     if (cands.length === 0) throw new Error('no result');
-    // Préfère le même millésime que Plex quand il est connu (homonymes, remakes).
-    let best = cands[0];
-    const wantYear = year !== undefined && year !== null && String(year).trim() !== '' ? String(year).trim() : '';
-    if (wantYear) {
-      const same = cands.find((r) => r.data && String(r.data.year || '') === wantYear);
-      if (same) best = same;
-    }
+    // Meilleur candidat : ressemblance titre + millésime Plex (homonymes, remakes, promos).
+    const best = pickAllocineCandidate(cands, query, year);
     const id = best.entity_id;
     const pageUrl =
       best.entity_type === 'series'

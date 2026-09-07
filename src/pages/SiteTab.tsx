@@ -19,6 +19,7 @@ import {
 } from '@ionic/react';
 import { openOutline, downloadOutline, magnetOutline, filmOutline, phonePortraitOutline, arrowBackOutline, arrowForwardOutline, refreshOutline } from 'ionicons/icons';
 import { Browser } from '@capacitor/browser';
+import { App as CapacitorApp } from '@capacitor/app';
 import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import { TR4KER_URL } from '../config/appConfig';
@@ -38,6 +39,10 @@ import {
 import { InlineBrowser, type InlineBrowserState, type UrlChangeEvent } from '../services/inlineBrowser';
 import FolderSheet from '../components/FolderSheet';
 import { requestBrowserOpen } from '../services/browserNavigation';
+
+/** Sauvegarde du storage TR4KER (session kill-proof), ~400 Ko max. */
+const TR4KER_STORAGE_BACKUP_KEY = 'tr4ker-storage-backup';
+const TR4KER_STORAGE_BACKUP_MAX = 400_000;
 
 const SiteTab: React.FC = () => {
   const history = useHistory();
@@ -60,13 +65,14 @@ const SiteTab: React.FC = () => {
   const inlineOpenedRef = useRef(false);
   const inlineListenersRef = useRef<PluginListenerHandle[]>([]);
   const inlineRectRafRef = useRef(0);
+  /** Restauration session déjà tentée pour la vue courante (anti-boucle reload). */
+  const storageRestoredRef = useRef(false);
   const [inlineState, setInlineState] = useState<InlineBrowserState>({
     url: TR4KER_URL,
     canGoBack: false,
     canGoForward: false,
   });
   const [inlineFailed, setInlineFailed] = useState(false);
-  const [showManual, setShowManual] = useState(false);
   const webviewRef = useRef<any>(null);
   const [tr4kerPreloadPath, setTr4kerPreloadPath] = useState<string | null>(null);
   const autoOpenRef = useRef(false);
@@ -77,7 +83,7 @@ const SiteTab: React.FC = () => {
     autoOpenRef.current = false;
     void browserRef.current?.close().catch(() => {});
     browserRef.current = null;
-    if (useInlineTr4ker) void closeInline();
+    if (useInlineTr4ker) hideInline();
   });
 
   /** Callbacks d'interception TR4KER partagés (modale + inline iOS). */
@@ -149,9 +155,22 @@ const SiteTab: React.FC = () => {
     });
   }
 
-  /** Ouvre TR4KER inline dans l'onglet (iOS). Échec -> écran de secours avec modale. */
+  /** Ouvre TR4KER inline dans l'onglet (iOS). Échec -> écran de secours avec modale.
+      La vue est créée une seule fois puis conservée (jamais détruite) : la
+      session TR4KER (cookies + sessionStorage + état SPA) survit aux
+      changements d'onglet et à la fiche dossier. */
+  /** Injection de l'intercepteur en secours (l'injection auto WKUserScript couvre déjà main + iframes). */
+  function injectInlineInterceptor() {
+    void InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
+  }
+
   async function openInline() {
-    if (inlineOpenedRef.current) return;
+    if (inlineOpenedRef.current) {
+      // Vue déjà vivante : on la réaffiche telle quelle au lieu de la recréer.
+      scheduleInlineRectSync();
+      injectInlineInterceptor();
+      return;
+    }
     setInlineFailed(false);
     setErrorMessage('');
     try {
@@ -159,7 +178,9 @@ const SiteTab: React.FC = () => {
       await new Promise((res) => requestAnimationFrame(() => res(null)));
       const rect = measureInlineRect();
       if (!rect) throw new Error('Conteneur TR4KER non mesurable');
-      await InlineBrowser.open({ url: TR4KER_URL, ...rect });
+      // injectScript : pièges armés par la WebView elle-même (main + iframes),
+      // avant tout clic possible (la réinjection load reste en secours).
+      await InlineBrowser.open({ url: TR4KER_URL, injectScript: INTERCEPTOR_WKWEBVIEW_JS, ...rect });
       inlineOpenedRef.current = true;
       const cbs = tr4kerCallbacks(false);
       inlineListenersRef.current = [
@@ -175,12 +196,16 @@ const SiteTab: React.FC = () => {
         }),
         await InlineBrowser.addListener('load', (state) => {
           setInlineState(state);
-          // Réinjection après chaque chargement (garde interne anti-double).
-          void InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
+          void (async () => {
+            // 1er chargement : restaure la session sauvegardée puis recharge
+            // (une fois) avant d'injecter l'intercepteur.
+            if (await restoreInlineStorageOnce()) return;
+            injectInlineInterceptor();
+          })();
         }),
       ];
       // Première injection (si la page est déjà chargée avant le 1er event load).
-      await InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
+      injectInlineInterceptor();
       setStatusMessage('TR4KER chargé dans l’onglet : touche un lien .torrent / magnet pour l’intercepter');
     } catch (e) {
       inlineOpenedRef.current = false;
@@ -190,22 +215,64 @@ const SiteTab: React.FC = () => {
     }
   }
 
-  async function closeInline() {
-    inlineListenersRef.current.forEach((h) => {
-      try {
-        h.remove();
-      } catch {
-        /* ignore */
-      }
-    });
-    inlineListenersRef.current = [];
-    inlineOpenedRef.current = false;
+  /** Masque la vue inline sans la détruire (session conservée).
+      Utilisé à la sortie de l'onglet et pendant la fiche dossier
+      (la vue native recouvre les overlays Ionic). */
+  function hideInline() {
     cancelAnimationFrame(inlineRectRafRef.current);
+    backupInlineStorage();
+    void InlineBrowser.setRect({ x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
+  }
+
+  /** Sauvegarde localStorage/sessionStorage TR4KER (le sessionStorage ne
+      survit pas au kill de l'app, contrairement aux cookies). */
+  function backupInlineStorage() {
+    if (!inlineOpenedRef.current) return;
+    void InlineBrowser.readStorage()
+      .then(({ json }) => {
+        if (!json || json.length > TR4KER_STORAGE_BACKUP_MAX) return;
+        try {
+          if (localStorage.getItem(TR4KER_STORAGE_BACKUP_KEY) !== json) {
+            localStorage.setItem(TR4KER_STORAGE_BACKUP_KEY, json);
+          }
+        } catch {
+          /* quota, ignore */
+        }
+      })
+      .catch(() => {});
+  }
+
+  /** Restaure une fois le storage sauvegardé puis recharge (le site lit son
+      storage au chargement : restauration + reload = session retrouvée). */
+  async function restoreInlineStorageOnce(): Promise<boolean> {
+    if (storageRestoredRef.current) return false;
+    storageRestoredRef.current = true;
+    let dump: { local?: Record<string, string>; session?: Record<string, string> } | null = null;
     try {
-      await InlineBrowser.close();
+      dump = JSON.parse(localStorage.getItem(TR4KER_STORAGE_BACKUP_KEY) || 'null') as {
+        local?: Record<string, string>;
+        session?: Record<string, string>;
+      } | null;
+    } catch {
+      dump = null;
+    }
+    const has =
+      !!dump && (Object.keys(dump.local || {}).length > 0 || Object.keys(dump.session || {}).length > 0);
+    if (!has || !dump) return false;
+    // encodeURIComponent : aucun " ni \ dans le payload -> injection sûre.
+    const payload = encodeURIComponent(JSON.stringify(dump));
+    const code = `(function(){try{var d=JSON.parse(decodeURIComponent("${payload}"));var L=d.local||{},S=d.session||{},k;for(k in L){try{window.localStorage.setItem(k,L[k]);}catch(e){}}for(k in S){try{window.sessionStorage.setItem(k,S[k]);}catch(e){}}}catch(e){}})();`;
+    try {
+      await InlineBrowser.executeScript({ code });
+    } catch {
+      return false;
+    }
+    try {
+      await InlineBrowser.reload();
     } catch {
       /* ignore */
     }
+    return true;
   }
 
   function inlineBack() {
@@ -404,8 +471,28 @@ const SiteTab: React.FC = () => {
     void openEmbedded();
   });
 
-  // iOS inline : suit les changements de mise en page (rotation, clavier,
-  // section manuelle) pour garder la vue native alignée sur le conteneur.
+  // iOS inline : sauvegarde périodique + à la mise en fond du storage TR4KER
+  // (le sessionStorage ne survit pas au kill de l'app).
+  useEffect(() => {
+    if (!useInlineTr4ker) return;
+    const id = window.setInterval(backupInlineStorage, 30000);
+    let off: (() => void) | null = null;
+    void CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) backupInlineStorage();
+    })
+      .then((h) => {
+        off = () => h.remove();
+      })
+      .catch(() => {});
+    return () => {
+      window.clearInterval(id);
+      if (off) off();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useInlineTr4ker]);
+
+  // iOS inline : suit les changements de mise en page (rotation, clavier)
+  // pour garder la vue native alignée sur le conteneur.
   useEffect(() => {
     if (!useInlineTr4ker) return;
     const el = inlineContainerRef.current;
@@ -421,7 +508,7 @@ const SiteTab: React.FC = () => {
       window.removeEventListener('orientationchange', onResize);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [useInlineTr4ker, showManual]);
+  }, [useInlineTr4ker]);
 
   // iOS inline : la vue native recouvre la WebView Ionic, donc aussi la fiche
   // dossier. On la masque (sans la détruire : la page reste chargée) quand la
@@ -711,11 +798,10 @@ const SiteTab: React.FC = () => {
             )}
           </div>
         ) : useInlineTr4ker ? (
-          /* iOS natif : TR4KER directement dans l'onglet (WKWebView inline).
-             La fiche dossier + toast restent (overlays Ionic révélés en
-             masquant temporairement la vue native, voir effet sur pending). */
+          /* iOS natif : TR4KER seul, plein onglet (fiche dossier + toast en overlays).
+             Pas de barre d'URL ni de statut : l'onglet ne contient que le site. */
           <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-            {inlineFailed ? (
+            {inlineFailed && (
               <IonCard>
                 <IonCardContent style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                   <p style={{ flex: 1, margin: 0 }}>
@@ -729,32 +815,8 @@ const SiteTab: React.FC = () => {
                   </IonButton>
                 </IonCardContent>
               </IonCard>
-            ) : (
-              <div style={{ padding: '4px 8px', display: 'flex', gap: 8, alignItems: 'center' }}>
-                <IonText color="medium" style={{ flex: 1, overflow: 'hidden' }}>
-                  <small
-                    style={{
-                      display: 'block',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {inlineState.url || TR4KER_URL}
-                  </small>
-                </IonText>
-                <IonButton size="small" fill="clear" onClick={() => setShowManual((v) => !v)}>
-                  {showManual ? 'Masquer' : 'Manuel'}
-                </IonButton>
-              </div>
             )}
-            {showManual && !inlineFailed && <div>{renderManualTools()}</div>}
             <div ref={inlineContainerRef} style={{ flex: 1, minHeight: 0, position: 'relative' }} />
-            <div style={{ padding: '2px 12px 6px' }}>
-              <IonText color={errorMessage ? 'danger' : 'medium'}>
-                <small>{errorMessage || `Statut : ${statusMessage}`}</small>
-              </IonText>
-            </div>
           </div>
         ) : (
           <>

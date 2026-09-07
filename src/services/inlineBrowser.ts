@@ -30,14 +30,18 @@ export interface UrlChangeEvent {
 }
 
 export interface InlineBrowserPlugin {
-  open(options: { url: string } & InlineBrowserRect): Promise<void>;
+  open(options: { url: string; injectScript?: string } & InlineBrowserRect): Promise<void>;
   setRect(options: InlineBrowserRect): Promise<void>;
   loadUrl(options: { url: string }): Promise<void>;
   goBack(): Promise<InlineBrowserState>;
   goForward(): Promise<InlineBrowserState>;
   reload(): Promise<void>;
   executeScript(options: { code: string }): Promise<void>;
+  /** Dump JSON {local, session} des storages de la page ("" si indisponible). */
+  readStorage(): Promise<{ json: string }>;
   close(): Promise<void>;
+  /** Relaye un log JS vers NSLog (console Xcode). No-op hors iOS. */
+  log(options: { level: string; tag: string; message: string }): Promise<void>;
   addListener(
     eventName: 'browserMessage',
     listenerFunc: (msg: Record<string, unknown>) => void,

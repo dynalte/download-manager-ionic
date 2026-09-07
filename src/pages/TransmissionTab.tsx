@@ -20,10 +20,13 @@ import {
   IonAlert,
   IonSpinner,
   IonBadge,
+  IonActionSheet,
+  IonToast,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, trashOutline, sparklesOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, trashOutline, sparklesOutline, mailOutline } from 'ionicons/icons';
 import { fetchDownloads, removeTorrent, type TransmissionDownloadItem } from '../services/transmission';
+import { BOOK_RECIPIENTS, isBookDownload, sendBookByEmail, type BookRecipient } from '../services/bookShare';
 import { fetchLinkRecords, normalizedTitleForMatching, type PlexLinkRecord } from '../services/plex';
 import { refreshLibraries } from '../services/plex';
 import { settings, folderDisplayName, folderForDownloadDir, type DestinationFolder } from '../services/settings';
@@ -47,6 +50,7 @@ const CAT_LABELS: Record<CatFilter, string> = {
   films: 'Films',
   series: 'Séries',
   musique: 'Musique',
+  livres: 'Livres',
   other: 'Autres',
 };
 
@@ -54,6 +58,7 @@ const CAT_COLORS: Record<Exclude<CatFilter, 'all'>, string> = {
   films: 'primary',
   series: 'success',
   musique: 'warning',
+  livres: 'tertiary',
   other: 'medium',
 };
 
@@ -136,6 +141,9 @@ const TransmissionTab: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [pendingDeletion, setPendingDeletion] = useState<TransmissionDownloadItem | null>(null);
+  const [mailTarget, setMailTarget] = useState<TransmissionDownloadItem | null>(null);
+  const [mailBusy, setMailBusy] = useState(false);
+  const [mailToast, setMailToast] = useState('');
   const [refreshingPlex, setRefreshingPlex] = useState(false);
   const [plexStatus, setPlexStatus] = useState('Plex inactif');
   const [showSettings, setShowSettings] = useState(false);
@@ -264,6 +272,22 @@ const TransmissionTab: React.FC = () => {
     event.detail.complete();
   }
 
+  /** Envoie le fichier d'un livre terminé par e-mail au destinataire choisi. */
+  async function handleSendBook(item: TransmissionDownloadItem, recipient: BookRecipient) {
+    setMailTarget(null);
+    if (mailBusy) return;
+    setMailBusy(true);
+    try {
+      const outcome = await sendBookByEmail(item, recipient);
+      if (outcome === 'sent') setMailToast(`E-mail envoyé à ${recipient.name}`);
+      else if (outcome === 'shared') setMailToast('Fichier prêt : choisis Mail pour l’envoyer');
+    } catch (e) {
+      setError(`Erreur envoi e-mail: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setMailBusy(false);
+    }
+  }
+
   return (
     <IonPage>
       <IonHeader>
@@ -319,6 +343,11 @@ const TransmissionTab: React.FC = () => {
                 <IonButton fill="clear" color="danger" slot="start" onClick={() => setPendingDeletion(d)}>
                   <IonIcon icon={trashOutline} />
                 </IonButton>
+                {(d.isFinished || d.percentDone >= 1.0) && isBookDownload(d.downloadDir) && (
+                  <IonButton fill="clear" slot="start" onClick={() => setMailTarget(d)} disabled={mailBusy}>
+                    <IonIcon icon={mailOutline} />
+                  </IonButton>
+                )}
                 <IonLabel>
                   <h2 style={{ whiteSpace: 'normal' }}>
                     {d.name} <CategoryBadge item={d} />
@@ -349,6 +378,21 @@ const TransmissionTab: React.FC = () => {
         </p>
 
         <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+        <IonActionSheet
+          isOpen={mailTarget !== null}
+          onDidDismiss={() => setMailTarget(null)}
+          header={`Envoyer « ${mailTarget?.name ?? ''} » par e-mail`}
+          buttons={[
+            ...BOOK_RECIPIENTS.map((r) => ({
+              text: `${r.name} <${r.email}>`,
+              handler: () => {
+                if (mailTarget) void handleSendBook(mailTarget, r);
+              },
+            })),
+            { text: 'Annuler', role: 'cancel' },
+          ]}
+        />
+        <IonToast isOpen={!!mailToast} message={mailToast} duration={3000} onDidDismiss={() => setMailToast('')} />
         <IonAlert
           isOpen={pendingDeletion !== null}
           header="Supprimer ce telechargement ?"

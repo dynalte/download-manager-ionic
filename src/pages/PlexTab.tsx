@@ -13,6 +13,7 @@ import {
   IonLabel,
   IonList,
   IonItem,
+  IonInput,
   IonText,
   IonSpinner,
   IonModal,
@@ -22,7 +23,7 @@ import {
   IonFooter,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, downloadOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, eyeOffOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, downloadOutline, searchOutline } from 'ionicons/icons';
 import { Capacitor } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import {
@@ -30,6 +31,7 @@ import {
   fetchPlayersDetailed,
   fetchSeasonEpisodes,
   fetchShowSeasons,
+  fetchWatchHistory,
   playOnPlayer,
   probeAndAddManualPlayer,
   removeManualPlayer as removeManualPlayerEntry,
@@ -45,6 +47,7 @@ import { fetchGeminiRecommendations, type GeminiRecommendation } from '../servic
 import { searchTorrents, downloadFilmTorrent, formatBytes, type DiscoveryFilm } from '../services/tr4kerDiscovery';
 import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
+import { loadSeenSuggestions, markSeenSuggestion, seenKeyFor, seenKeys, type SeenSuggestion } from '../services/seenSuggestions';
 import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { isDesktopElectron } from '../services/embeddedBrowser';
@@ -97,6 +100,15 @@ const PlexTab: React.FC = () => {
   const [suggestions, setSuggestions] = useState<GeminiRecommendation[]>([]);
   const [suggestCount, setSuggestCount] = useState(10);
   const [suggestWant, setSuggestWant] = useState<'all' | 'movies' | 'series'>('all');
+  const [semanticQuery, setSemanticQuery] = useState('');
+  /** Nombre de vus (historique, même supprimés) exclus des dernières suggestions. */
+  const [suggestHistoryCount, setSuggestHistoryCount] = useState(0);
+  /** Suggestions marquées « déjà vu » (persistées, exclues des générations). */
+  const [seenList, setSeenList] = useState<SeenSuggestion[]>(() => loadSeenSuggestions());
+  /** Notes Allociné par suggestion (clé titre|année, rempli en arrière-plan). */
+  const [suggestRatingsMap, setSuggestRatingsMap] = useState<Record<string, AllocineRatings>>({});
+  const suggestRatingsMapRef = useRef<Record<string, AllocineRatings>>({});
+  const suggestRatingsReq = useRef(0);
   /** Torrents TR4KER trouvés par suggestion (index -> résultats). */
   const [dlResults, setDlResults] = useState<Record<number, DiscoveryFilm[]>>({});
   const [dlLoading, setDlLoading] = useState<number | null>(null);
@@ -248,18 +260,92 @@ const PlexTab: React.FC = () => {
         lib.items.map((i) => ({ title: i.title, year: i.year, type: i.type })),
       );
       if (entries.length === 0) throw new Error('Librairie Plex vide.');
+      // Historique de visionnage (vus même supprimés) + titres marqués « déjà vu » :
+      // best effort, exclus des suggestions (prompt Gemini + filtre local).
+      let history: { title: string; year?: string; type: string }[] = [];
+      let seen = seenList;
+      try {
+        seen = loadSeenSuggestions();
+        setSeenList(seen);
+      } catch {
+        /* repli : état en mémoire */
+      }
+      try {
+        history = await fetchWatchHistory(
+          settings.plexResolvedBaseURL,
+          settings.plexToken,
+          500,
+        );
+      } catch {
+        history = [];
+      }
+      setSuggestHistoryCount(history.length);
+      const seenEntries = seen.map((s) => ({ title: s.t, year: s.y, type: 'unknown' }));
+      const intent = semanticQuery.trim();
       const recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
         count: suggestCount,
         want: suggestWant,
         model: settings.geminiModel,
+        intent: intent || undefined,
+        history: [...history, ...seenEntries],
       });
-      setSuggestions(recs);
+      // Filet local : exclut les « déjà vu » même si Gemini les renvoie.
+      const seenSet = seenKeys(seen);
+      setSuggestions(recs.filter((r) => !seenSet.has(seenKeyFor(r.title))));
     } catch (e) {
       setSuggestError(e instanceof Error ? e.message : String(e));
     } finally {
       setSuggestLoading(false);
     }
   }
+
+  /** Bouton unique : suggestions ABSENTES de Plex, biaisées par l'intention si saisie. */
+  async function generateUnified() {
+    await generateSuggestions();
+  }
+
+  /** Marque une suggestion comme déjà vue : persistée + retirée de la liste. */
+  function markSuggestionSeen(rec: GeminiRecommendation) {
+    const next = markSeenSuggestion(rec.title, rec.year);
+    setSeenList(next);
+    const keys = seenKeys(next);
+    setSuggestions((prev) => prev.filter((r) => !keys.has(seenKeyFor(r.title))));
+  }
+
+  function suggestRatingKey(rec: GeminiRecommendation): string {
+    return `${rec.title.trim().toLowerCase()}|${(rec.year || '').trim()}`;
+  }
+
+  // Notes Allociné des suggestions en arrière-plan (concurrence limitée, comme Films/Plex).
+  useEffect(() => {
+    const reqId = ++suggestRatingsReq.current;
+    const pending = suggestions.filter((r) => !suggestRatingsMapRef.current[suggestRatingKey(r)]).slice(0, 30);
+    if (pending.length === 0) return;
+    let cursor = 0;
+    let active = 0;
+    const CONCURRENCY = 3;
+    const pump = () => {
+      if (suggestRatingsReq.current !== reqId) return;
+      while (active < CONCURRENCY && cursor < pending.length) {
+        const rec = pending[cursor++];
+        active += 1;
+        void fetchAllocineRatings(rec.title, rec.year)
+          .then((r) => {
+            if (r && suggestRatingsReq.current === reqId) {
+              suggestRatingsMapRef.current = { ...suggestRatingsMapRef.current, [suggestRatingKey(rec)]: r };
+              setSuggestRatingsMap(suggestRatingsMapRef.current);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            active -= 1;
+            pump();
+          });
+      }
+    };
+    const stagger = window.setTimeout(pump, 600);
+    return () => window.clearTimeout(stagger);
+  }, [suggestions]);
 
   /** Recherche les torrents TR4KER d'une suggestion (films + séries). */
   async function searchTorrentsFor(rec: GeminiRecommendation, index: number) {
@@ -801,7 +887,7 @@ const PlexTab: React.FC = () => {
         <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
 
         {/* Suggestions IA Gemini basées sur la collection */}
-        <IonModal isOpen={showSuggest} onDidDismiss={() => setShowSuggest(false)}>
+        <IonModal isOpen={showSuggest} onDidDismiss={() => setShowSuggest(false)} className="detail-modal">
           <IonHeader>
             <IonToolbar>
               <IonTitle>Suggestions IA</IonTitle>
@@ -811,10 +897,10 @@ const PlexTab: React.FC = () => {
             </IonToolbar>
           </IonHeader>
           <IonContent>
-            <div style={{ padding: '12px 16px' }}>
+            <div className="detail-sheet">
               <IonText color="medium">
                 <p style={{ marginTop: 0 }}>
-                  Gemini analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération) pour proposer des films/séries absents de ta collection.
+                  Gemini analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération{suggestHistoryCount > 0 ? ` + ${suggestHistoryCount} vus (historique, même supprimés)` : ''}{seenList.length > 0 ? ` + ${seenList.length} marqués vus` : ''}) pour proposer des films/séries ni en collection ni déjà vus.
                 </p>
               </IonText>
               <IonSegment
@@ -831,20 +917,31 @@ const PlexTab: React.FC = () => {
                   <IonLabel>Séries</IonLabel>
                 </IonSegmentButton>
               </IonSegment>
-              <IonSegment
-                value={String(suggestCount)}
-                onIonChange={(e) => setSuggestCount(parseInt(String(e.detail.value), 10) || 10)}
-                style={{ marginTop: 8 }}
+
+              <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', background: 'var(--ion-color-light)', borderRadius: 4, padding: '0 8px' }}>
+                  <IonIcon icon={searchOutline} color="medium" />
+                  <IonInput
+                    placeholder="Optionnel : envie (ex: film d'action sombre...) — que du ABSENT de Plex"
+                    value={semanticQuery}
+                    onIonInput={(e) => setSemanticQuery(e.detail.value!)}
+                    style={{ padding: '8px 0' }}
+                  />
+                </div>
+              </div>
+
+              <IonButton
+                expand="block"
+                style={{ marginTop: 12 }}
+                onClick={() => void generateUnified()}
+                disabled={suggestLoading}
               >
-                {[5, 10, 15, 20].map((n) => (
-                  <IonSegmentButton key={n} value={String(n)}>
-                    <IonLabel>{n}</IonLabel>
-                  </IonSegmentButton>
-                ))}
-              </IonSegment>
-              <IonButton expand="block" style={{ marginTop: 12 }} onClick={() => void generateSuggestions()} disabled={suggestLoading}>
                 <IonIcon icon={sparklesOutline} slot="start" />
-                {suggestLoading ? 'Analyse en cours...' : 'Générer les suggestions'}
+                {suggestLoading
+                  ? 'Analyse en cours...'
+                  : semanticQuery.trim()
+                    ? `Suggérer des nouveautés : ${semanticQuery.trim().slice(0, 30)}${semanticQuery.trim().length > 30 ? '…' : ''}`
+                    : 'Générer les suggestions (absents de Plex)'}
               </IonButton>
               {suggestLoading && (
                 <div style={{ textAlign: 'center', padding: 16 }}>
@@ -886,6 +983,33 @@ const PlexTab: React.FC = () => {
                           <IonText color="medium">{rec.reason}</IonText>
                         </p>
                       )}
+                      {(() => {
+                        const r = suggestRatingsMap[suggestRatingKey(rec)];
+                        if (!r) return null;
+                        if (r.press == null && r.spectators == null) return null;
+                        return (
+                          <div style={{ display: 'flex', gap: 12, marginTop: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                            {r.spectators != null && (
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <RatingStars value={r.spectators} size={14} />
+                                <strong>{formatAllocineNote(r.spectators)}</strong>
+                                <IonText color="medium">
+                                  <small>Spectateurs{r.votes ? ` • ${r.votes.toLocaleString('fr-FR')} votes` : ''}</small>
+                                </IonText>
+                              </span>
+                            )}
+                            {r.press != null && (
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <RatingStars value={r.press} size={14} />
+                                <strong>{formatAllocineNote(r.press)}</strong>
+                                <IonText color="medium">
+                                  <small>Presse{r.pressReviews ? ` • ${r.pressReviews} critiques` : ''}</small>
+                                </IonText>
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
                       <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
                         <IonButton
                           size="small"
@@ -906,6 +1030,14 @@ const PlexTab: React.FC = () => {
                         >
                           <IonIcon icon={downloadOutline} slot="start" />
                           {dlResults[i] !== undefined ? 'Masquer' : 'Télécharger'}
+                        </IonButton>
+                        <IonButton
+                          size="small"
+                          fill="clear"
+                          onClick={() => markSuggestionSeen(rec)}
+                        >
+                          <IonIcon icon={eyeOffOutline} slot="start" />
+                          Déjà vu
                         </IonButton>
                       </div>
                       {dlLoading === i && (
@@ -969,7 +1101,7 @@ const PlexTab: React.FC = () => {
           </IonContent>
           <IonFooter>
             <IonToolbar>
-              <IonButton expand="block" fill="clear" onClick={() => void generateSuggestions()} disabled={suggestLoading}>
+              <IonButton expand="block" fill="clear" onClick={() => void generateUnified()} disabled={suggestLoading}>
                 <IonIcon icon={refreshOutline} slot="start" />
                 Relancer avec d'autres idées
               </IonButton>

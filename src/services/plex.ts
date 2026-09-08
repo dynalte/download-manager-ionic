@@ -467,6 +467,63 @@ export async function fetchLibrariesData(
   return out;
 }
 
+/** Entrée d'historique de visionnage (conservée même si le média est supprimé). */
+export interface PlexHistoryItem {
+  title: string;
+  year?: string;
+  /** 'movie' | 'show' (épisodes rattachés à leur série). */
+  type: string;
+  viewedAt?: Date;
+}
+
+/**
+ * Historique de visionnage du serveur (`/status/sessions/history/all`).
+ * Conservé par Plex même après suppression du média (et vidage de la
+ * corbeille) : idéal pour exclure les déjà-vus des suggestions IA.
+ * Best effort : tableau vide en cas d'échec (vieux PMS, droits limités).
+ */
+export async function fetchWatchHistory(
+  baseURLString: string,
+  token: string,
+  limit = 500,
+): Promise<PlexHistoryItem[]> {
+  const ctx = await resolveServerContext(baseURLString, token);
+  const size = Math.min(Math.max(limit, 1), 2000);
+  const url =
+    `${ctx.baseURL}/status/sessions/history/all` +
+    `?sort=viewedAt%3Adesc&X-Plex-Container-Start=0&X-Plex-Container-Size=${size}`;
+  const doc = await getXML(url, token);
+  const els = Array.from(doc.getElementsByTagName('Video'));
+  const seen = new Set<string>();
+  const out: PlexHistoryItem[] = [];
+  for (const el of els) {
+    const rawType = (el.getAttribute('type') ?? '').toLowerCase();
+    let title = '';
+    let year: string | undefined;
+    let type = 'movie';
+    if (rawType === 'episode') {
+      title = decodeEntities(el.getAttribute('grandparentTitle') ?? '');
+      year = el.getAttribute('grandparentYear') ?? undefined;
+      type = 'show';
+    } else if (rawType === 'movie') {
+      title = decodeEntities(el.getAttribute('title') ?? '');
+      year = el.getAttribute('year') ?? undefined;
+      type = 'movie';
+    } else {
+      continue; // clips, pistes… hors scope suggestions
+    }
+    title = title.trim();
+    if (!title) continue;
+    const key = `${type}|${normalizedTitleForMatching(title)}`;
+    if (seen.has(key)) continue; // déduplique : ne garde que le plus récent
+    seen.add(key);
+    const viewedRaw = el.getAttribute('viewedAt') ?? el.getAttribute('lastViewedAt') ?? '';
+    const viewedAt = viewedRaw && viewedRaw !== '0' ? new Date(parseInt(viewedRaw, 10) * 1000) : undefined;
+    out.push({ title, year, type, viewedAt });
+  }
+  return out;
+}
+
 export async function fetchShowSeasons(
   baseURLString: string,
   token: string,

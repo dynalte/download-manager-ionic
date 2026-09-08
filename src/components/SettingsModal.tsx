@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   IonModal,
   IonHeader,
@@ -28,6 +28,7 @@ import {
   setSetting,
 } from '../services/settings';
 import { requestAuthorizationIfNeeded } from '../services/completionMonitor';
+import { clearSeenSuggestions, loadSeenSuggestions } from '../services/seenSuggestions';
 import { getThemeMode, setThemeMode, type ThemeMode } from '../services/theme';
 
 function useStored(key: string, fallback: string) {
@@ -58,6 +59,10 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
   const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-2.5-flash');
+  const [seenCount, setSeenCount] = useState(0);
+  useEffect(() => {
+    if (isOpen) setSeenCount(loadSeenSuggestions().length);
+  }, [isOpen]);
   // Valeur stockée migrée à l'affichage (2.0/1.5 retirés par Google).
   const geminiModel =
     !geminiModelRaw || geminiModelRaw === 'gemini-2.0-flash' || geminiModelRaw.startsWith('gemini-1.5') || geminiModelRaw === 'gemini-pro'
@@ -159,6 +164,23 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           </IonItem>
           <IonItem>
             <IonInput label="Modèle Gemini" labelPlacement="stacked" value={geminiModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiModel(String(e.detail.value ?? ''))} placeholder="gemini-2.5-flash" />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Suggestions marquées « déjà vu » : {seenCount}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="clear"
+              disabled={seenCount === 0}
+              onClick={() => {
+                clearSeenSuggestions();
+                setSeenCount(0);
+              }}
+            >
+              Effacer
+            </IonButton>
           </IonItem>
 
           <IonItem>

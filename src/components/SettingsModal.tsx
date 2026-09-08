@@ -56,6 +56,13 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [fileServerUser, setFileServerUser] = useStored(Keys.fileServerUsername, AppConfig.fileServerUsername);
   const [fileServerPass, setFileServerPass] = useStored(Keys.fileServerPassword, AppConfig.fileServerPassword);
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
+  const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
+  const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-2.5-flash');
+  // Valeur stockée migrée à l'affichage (2.0/1.5 retirés par Google).
+  const geminiModel =
+    !geminiModelRaw || geminiModelRaw === 'gemini-2.0-flash' || geminiModelRaw.startsWith('gemini-1.5') || geminiModelRaw === 'gemini-pro'
+      ? 'gemini-2.5-flash'
+      : geminiModelRaw;
   const [plexBaseURL, setPlexBaseURL] = useStored(Keys.plexBaseURL, AppConfig.plexBaseURL);
   const [plexToken, setPlexToken] = useStored(Keys.plexToken, AppConfig.plexToken);
   const [plexSectionKeysCSV, setPlexSectionKeysCSV] = useStored(Keys.plexSectionKeysCSV, '');
@@ -139,6 +146,19 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           </IonItem>
           <IonItem>
             <IonInput label="Clé API TR4KER" labelPlacement="stacked" type="password" value={tr4kerApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setTr4kerApiKey(String(e.detail.value ?? ''))} />
+          </IonItem>
+
+          <IonItem>
+            <IonLabel>
+              <h2>IA Gemini (suggestions Plex)</h2>
+              <p>Clé gratuite sur aistudio.google.com/apikey. La collection Plex (titres uniquement) est envoyée à Gemini.</p>
+            </IonLabel>
+          </IonItem>
+          <IonItem>
+            <IonInput label="Clé API Gemini" labelPlacement="stacked" type="password" value={geminiApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiApiKey(String(e.detail.value ?? ''))} placeholder="AIza..." />
+          </IonItem>
+          <IonItem>
+            <IonInput label="Modèle Gemini" labelPlacement="stacked" value={geminiModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiModel(String(e.detail.value ?? ''))} placeholder="gemini-2.5-flash" />
           </IonItem>
 
           <IonItem>

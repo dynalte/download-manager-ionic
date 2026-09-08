@@ -19,10 +19,14 @@ export interface AllocineRatings {
   pressReviews: number | null;
   spectators: number | null;
   votes: number | null;
+  /** Affiche de la fiche (og:image). Absent des entrées de cache v2. */
+  posterURL?: string | null;
+  /** Synopsis (JSON-LD puis og:description). Absent des entrées de cache v2. */
+  synopsis?: string | null;
 }
 
 const ALLOCINE_TTL = 30 * 24 * 3600 * 1000;
-const ALLOCINE_CACHE_KEY = 'allocine-ratings-cache-v2';
+const ALLOCINE_CACHE_KEY = 'allocine-ratings-cache-v3';
 const ALLOCINE_CACHE_MAX = 500;
 
 const nativeCache = new Map<string, { at: number; data: AllocineRatings }>();
@@ -65,6 +69,64 @@ function parseAllocineVotes(txt: unknown): number | null {
   if (!m) return null;
   const n = parseInt(m[1].replace(/\s/g, ''), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Décode les entités HTML (pas de DOM dispo partout : regex uniquement). */
+function decodeHtmlEntities(s: string): string {
+  return String(s ?? '')
+    .replace(/&#(\d+);/g, (_, n: string) => {
+      const c = parseInt(n, 10);
+      return Number.isFinite(c) ? String.fromCharCode(c) : _;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n: string) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&hellip;/g, '…');
+}
+
+function metaContent(html: string, property: string): string | null {
+  const re1 = new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']+)["']`, 'i');
+  const re2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${property}["']`, 'i');
+  const m = re1.exec(html) || re2.exec(html);
+  return m ? m[1].trim() : null;
+}
+
+/** Affiche de la fiche (og:image), en écartant logos et images génériques. */
+function parseAllocinePoster(html: string): string | null {
+  const url = metaContent(html, 'og:image');
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  if (/logo/i.test(url)) return null;
+  return url;
+}
+
+/** Synopsis : JSON-LD (schéma Movie/TVSeries) puis og:description. */
+function parseAllocineSynopsis(html: string): string | null {
+  const clean = (s: string): string | null => {
+    const txt = decodeHtmlEntities(s).replace(/\s+/g, ' ').trim();
+    if (txt.length < 40) return null;
+    // Écarte les descriptions génériques du site (pas un synopsis).
+    if (/allocin[ée].*(bandes-annonces|cinéma|films à l'affiche|séries du moment)/i.test(txt)) return null;
+    return txt;
+  };
+  const ld = /"description"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(html);
+  if (ld) {
+    try {
+      const txt = clean(JSON.parse(`"${ld[1]}"`) as string);
+      if (txt) return txt;
+    } catch {
+      /* JSON invalide : suite */
+    }
+  }
+  const og = metaContent(html, 'og:description');
+  if (og) {
+    const txt = clean(og);
+    if (txt) return txt;
+  }
+  return null;
 }
 
 interface AllocineCandidate {
@@ -212,17 +274,25 @@ async function fetchAllocineRatingsAttempt(query: string, year?: number | string
       votes = Number.isFinite(n) ? n : null;
     }
   }
-  if (press === null && spectators === null) throw new Error('no rating');
-  return {
-    title: best.label || best.original_label || '',
-    year: String((best.data && best.data.year) || ''),
-    url: pageUrl,
-    press,
-    pressReviews,
-    spectators,
-    votes,
-  };
-}
+    // Affiche + synopsis même sans notes (la fiche Films les veut dans tous
+    // les cas) : on ne jette que si la page n'a rien livré du tout.
+    const posterURL = parseAllocinePoster(html);
+    const synopsis = parseAllocineSynopsis(html);
+    if (press === null && spectators === null && posterURL === null && synopsis === null) {
+      throw new Error('no rating');
+    }
+    return {
+      title: best.label || best.original_label || '',
+      year: String((best.data && best.data.year) || ''),
+      url: pageUrl,
+      press,
+      pressReviews,
+      spectators,
+      votes,
+      posterURL,
+      synopsis,
+    };
+  }
 
 export async function fetchAllocineRatings(rawTitle: string, year?: number | string | null): Promise<AllocineRatings | null> {
   const query = buildAllocineQuery(rawTitle);
@@ -232,7 +302,7 @@ export async function fetchAllocineRatings(rawTitle: string, year?: number | str
   if (d?.isElectron && typeof d.allocineRatings === 'function') {
     try {
       const r = await d.allocineRatings({ query, year: year ?? undefined });
-      if (!r || (r.press == null && r.spectators == null)) return null;
+      if (!r || (r.press == null && r.spectators == null && r.posterURL == null && r.synopsis == null)) return null;
       return {
         title: String(r.title || ''),
         year: String(r.year || ''),
@@ -241,6 +311,8 @@ export async function fetchAllocineRatings(rawTitle: string, year?: number | str
         pressReviews: r.pressReviews ?? null,
         spectators: r.spectators ?? null,
         votes: r.votes ?? null,
+        posterURL: r.posterURL ?? null,
+        synopsis: r.synopsis ?? null,
       };
     } catch {
       return null;

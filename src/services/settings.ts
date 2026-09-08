@@ -25,6 +25,8 @@ export const Keys = {
   plexMediaFilter: 'plex_media_filter',
   plexWatchFilter: 'plex_watch_filter',
   plexDisplayMode: 'plex_display_mode',
+  geminiApiKey: 'gemini_api_key',
+  geminiModel: 'gemini_model',
 } as const;
 
 export const DEFAULT_FOLDER_FILMS = '/downloads/films';
@@ -159,6 +161,18 @@ export const settings = {
   get tr4kerApiKey(): string {
     const stored = getString(Keys.tr4kerApiKey, '').trim();
     return stored === '' ? AppConfig.tr4kerApiKey : stored;
+  },
+  /** Clé API Google AI Studio pour les suggestions Gemini. Vide = désactivé. */
+  get geminiApiKey(): string {
+    return getString(Keys.geminiApiKey, '').trim();
+  },
+  get geminiModel(): string {
+    const stored = getString(Keys.geminiModel, '').trim();
+    // Migration : gemini-2.0-flash (et 1.5) retirés par Google → défaut actuel.
+    if (stored === '' || stored === 'gemini-2.0-flash' || stored.startsWith('gemini-1.5') || stored === 'gemini-pro') {
+      return 'gemini-2.5-flash';
+    }
+    return stored;
   },
 };
 

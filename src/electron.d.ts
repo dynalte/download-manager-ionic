@@ -51,6 +51,8 @@ export interface DesktopBridge {
     pressReviews: number | null;
     spectators: number | null;
     votes: number | null;
+    posterURL?: string | null;
+    synopsis?: string | null;
   } | null>;
   /** Sauvegarde immédiate des cookies TR4KER (diagnostic). */
   cookiesBackupNow: () => Promise<{ saved: number }>;

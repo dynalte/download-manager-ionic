@@ -495,7 +495,7 @@ ipcMain.handle('tr4ker:close', () => {
 // --- Notes Allociné (automatiques) ---
 // Chaîne : autocomplete public (/_/autocomplete/<q>) -> fiche film/série SSR
 // -> notes presse/spectateurs parsées. Cache JSON 30 j + mémoire (500 entrées).
-const ALLOCINE_FILE = 'allocine-ratings-v2.json';
+const ALLOCINE_FILE = 'allocine-ratings-v3.json';
 const ALLOCINE_TTL = 30 * 24 * 3600 * 1000;
 const allocineCache = new Map();
 
@@ -561,6 +561,60 @@ function parseAllocineVotes(txt) {
   if (!m) return null;
   const n = parseInt(m[1].replace(/\s/g, ''), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+function decodeAllocineEntities(s) {
+  return String(s == null ? '' : s)
+    .replace(/&#(\d+);/g, (m, n) => {
+      const c = parseInt(n, 10);
+      return Number.isFinite(c) ? String.fromCharCode(c) : m;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&hellip;/g, '…');
+}
+
+function allocineMetaContent(html, property) {
+  const re1 = new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']+)["']`, 'i');
+  const re2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${property}["']`, 'i');
+  const m = re1.exec(html) || re2.exec(html);
+  return m ? m[1].trim() : null;
+}
+
+function parseAllocinePoster(html) {
+  const url = allocineMetaContent(html, 'og:image');
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  if (/logo/i.test(url)) return null;
+  return url;
+}
+
+function parseAllocineSynopsis(html) {
+  const clean = (s) => {
+    const txt = decodeAllocineEntities(s).replace(/\s+/g, ' ').trim();
+    if (txt.length < 40) return null;
+    if (/allocin[ée].*(bandes-annonces|cinéma|films à l'affiche|séries du moment)/i.test(txt)) return null;
+    return txt;
+  };
+  const ld = /"description"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(html);
+  if (ld) {
+    try {
+      const txt = clean(JSON.parse(`"${ld[1]}"`));
+      if (txt) return txt;
+    } catch {
+      /* JSON invalide : suite */
+    }
+  }
+  const og = allocineMetaContent(html, 'og:description');
+  if (og) {
+    const txt = clean(og);
+    if (txt) return txt;
+  }
+  return null;
 }
 
 function allocineNorm(s) {
@@ -657,7 +711,13 @@ async function allocineRatingsFor(query, year) {
         votes = Number.isFinite(n) ? n : null;
       }
     }
-    if (press === null && spectators === null) throw new Error('no rating');
+    // Affiche + synopsis même sans notes (fiche Films) : on ne jette que si
+    // la page n'a rien livré du tout.
+    const posterURL = parseAllocinePoster(html);
+    const synopsis = parseAllocineSynopsis(html);
+    if (press === null && spectators === null && posterURL === null && synopsis === null) {
+      throw new Error('no rating');
+    }
     data = {
       title: best.label || best.original_label || '',
       year: (best.data && best.data.year) || '',
@@ -666,6 +726,8 @@ async function allocineRatingsFor(query, year) {
       pressReviews,
       spectators,
       votes,
+      posterURL,
+      synopsis,
     };
   } catch {
     return (hit && hit.data) || null; // repli : cache périmé plutôt que rien

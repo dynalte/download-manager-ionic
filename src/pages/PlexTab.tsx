@@ -22,7 +22,7 @@ import {
   IonFooter,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, downloadOutline } from 'ionicons/icons';
 import { Capacitor } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import {
@@ -39,8 +39,11 @@ import {
   type PlexPlayerTarget,
   type PlexSeasonItem,
 } from '../services/plex';
-import { settings, Keys } from '../services/settings';
+import { settings, Keys, transmissionPath } from '../services/settings';
 import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
+import { fetchGeminiRecommendations, type GeminiRecommendation } from '../services/gemini';
+import { searchTorrents, downloadFilmTorrent, formatBytes, type DiscoveryFilm } from '../services/tr4kerDiscovery';
+import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
 import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
 import { requestBrowserOpen } from '../services/browserNavigation';
@@ -87,6 +90,19 @@ const PlexTab: React.FC = () => {
   const [ratingsMap, setRatingsMap] = useState<Record<string, AllocineRatings>>({});
   const ratingsMapRef = useRef<Record<string, AllocineRatings>>({});
   const ratingsFillReq = useRef(0);
+  /** Suggestions IA Gemini */
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [suggestError, setSuggestError] = useState('');
+  const [suggestions, setSuggestions] = useState<GeminiRecommendation[]>([]);
+  const [suggestCount, setSuggestCount] = useState(10);
+  const [suggestWant, setSuggestWant] = useState<'all' | 'movies' | 'series'>('all');
+  /** Torrents TR4KER trouvés par suggestion (index -> résultats). */
+  const [dlResults, setDlResults] = useState<Record<number, DiscoveryFilm[]>>({});
+  const [dlLoading, setDlLoading] = useState<number | null>(null);
+  const [dlError, setDlError] = useState<Record<number, string>>({});
+  const [sendingSlug, setSendingSlug] = useState<string | null>(null);
+  const [dlMsg, setDlMsg] = useState('');
 
   /** Note la plus parlante pour l'affichage compact (spectateurs > presse). */
   function bestNote(r: AllocineRatings): number | null {
@@ -199,6 +215,106 @@ const PlexTab: React.FC = () => {
       window.clearTimeout(stagger);
     };
   }, [libraries, filteredLibraries]);
+
+  async function generateSuggestions() {
+    if (!settings.geminiApiKey) {
+      setSuggestError('Clé API Gemini manquante : ouvre Réglages > IA Gemini (clé gratuite sur aistudio.google.com/apikey).');
+      return;
+    }
+    setSuggestLoading(true);
+    setSuggestError('');
+    setDlResults({});
+    setDlError({});
+    setDlMsg('');
+    try {
+      // Base la suggestion sur la collection COMPLÈTE (pas les 20 derniers affichés) :
+      // recharge jusqu'à 1000 items/section, repli sur la liste déjà chargée si échec.
+      let source = libraries;
+      try {
+        const full = await fetchLibrariesData(
+          settings.plexResolvedBaseURL,
+          settings.plexToken,
+          settings.plexSectionKeys,
+          1000,
+        );
+        if (full.length > 0) {
+          source = full;
+          setLibraries(full);
+        }
+      } catch {
+        /* repli : liste affichée */
+      }
+      const entries = source.flatMap((lib) =>
+        lib.items.map((i) => ({ title: i.title, year: i.year, type: i.type })),
+      );
+      if (entries.length === 0) throw new Error('Librairie Plex vide.');
+      const recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+        count: suggestCount,
+        want: suggestWant,
+        model: settings.geminiModel,
+      });
+      setSuggestions(recs);
+    } catch (e) {
+      setSuggestError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSuggestLoading(false);
+    }
+  }
+
+  /** Recherche les torrents TR4KER d'une suggestion (films + séries). */
+  async function searchTorrentsFor(rec: GeminiRecommendation, index: number) {
+    // Repli : referme si déjà affiché.
+    if (dlResults[index] !== undefined && dlLoading !== index) {
+      setDlResults((prev) => {
+        const next = { ...prev };
+        delete next[index];
+        return next;
+      });
+      return;
+    }
+    const apiKey = settings.tr4kerApiKey;
+    if (!apiKey) {
+      setDlError((prev) => ({ ...prev, [index]: 'Clé API TR4KER manquante : ajoute-la dans Réglages.' }));
+      return;
+    }
+    setDlLoading(index);
+    setDlError((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+    try {
+      const found = await searchTorrents(apiKey, rec.year ? `${rec.title} ${rec.year}` : rec.title);
+      setDlResults((prev) => ({ ...prev, [index]: found }));
+    } catch (e) {
+      setDlError((prev) => ({ ...prev, [index]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setDlLoading(null);
+    }
+  }
+
+  /** Télécharge le .torrent puis l'envoie vers Transmission (dossier films/séries). */
+  async function sendSuggestionTorrent(film: DiscoveryFilm, rec: GeminiRecommendation) {
+    if (sendingSlug) return;
+    const apiKey = settings.tr4kerApiKey;
+    if (!apiKey) {
+      setDlMsg('Clé API TR4KER manquante (Réglages).');
+      return;
+    }
+    setSendingSlug(film.slug);
+    setDlMsg('');
+    try {
+      const bytes = await downloadFilmTorrent(film.slug, apiKey);
+      const folder = rec.type === 'series' ? transmissionPath('series') : transmissionPath('films');
+      const res = await uploadTorrentData(bytes, folder);
+      const name = res.added?.name ?? res.duplicate?.name ?? film.title;
+      setDlMsg(res.duplicate ? `Déjà présent dans Transmission : ${name}` : `Ajouté vers Transmission (${folder}) : ${name}`);
+    } catch (e) {
+      setDlMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSendingSlug(null);
+    }
+  }
 
   async function preparePlayback(item: PlexLibraryItem) {
     setSelectedItem(item);
@@ -361,6 +477,9 @@ const PlexTab: React.FC = () => {
         <IonToolbar>
           <IonTitle>Plex</IonTitle>
           <IonButtons slot="end">
+            <IonButton onClick={() => { setSuggestError(''); setShowSuggest(true); }} title="Suggestions IA">
+              <IonIcon icon={sparklesOutline} />
+            </IonButton>
             <IonButton onClick={() => setShowSettings(true)}>
               <IonIcon icon={settingsOutline} />
             </IonButton>
@@ -432,6 +551,14 @@ const PlexTab: React.FC = () => {
                 >
                   <IonIcon icon={eyeOutline} slot="start" />
                   {watchFilter === 'all' ? 'Tous' : watchFilter === 'watched' ? 'Vus' : 'Non vus'}
+                </IonButton>
+                <IonButton
+                  size="small"
+                  fill="outline"
+                  onClick={() => { setSuggestError(''); setShowSuggest(true); }}
+                >
+                  <IonIcon icon={sparklesOutline} slot="start" />
+                  Suggestions IA
                 </IonButton>
               </div>
               {lastRefresh && (
@@ -672,6 +799,183 @@ const PlexTab: React.FC = () => {
         </IonModal>
 
         <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+
+        {/* Suggestions IA Gemini basées sur la collection */}
+        <IonModal isOpen={showSuggest} onDidDismiss={() => setShowSuggest(false)}>
+          <IonHeader>
+            <IonToolbar>
+              <IonTitle>Suggestions IA</IonTitle>
+              <IonButtons slot="end">
+                <IonButton onClick={() => setShowSuggest(false)}>Fermer</IonButton>
+              </IonButtons>
+            </IonToolbar>
+          </IonHeader>
+          <IonContent>
+            <div style={{ padding: '12px 16px' }}>
+              <IonText color="medium">
+                <p style={{ marginTop: 0 }}>
+                  Gemini analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération) pour proposer des films/séries absents de ta collection.
+                </p>
+              </IonText>
+              <IonSegment
+                value={suggestWant}
+                onIonChange={(e) => setSuggestWant(String(e.detail.value) as 'all' | 'movies' | 'series')}
+              >
+                <IonSegmentButton value="all">
+                  <IonLabel>Tous</IonLabel>
+                </IonSegmentButton>
+                <IonSegmentButton value="movies">
+                  <IonLabel>Films</IonLabel>
+                </IonSegmentButton>
+                <IonSegmentButton value="series">
+                  <IonLabel>Séries</IonLabel>
+                </IonSegmentButton>
+              </IonSegment>
+              <IonSegment
+                value={String(suggestCount)}
+                onIonChange={(e) => setSuggestCount(parseInt(String(e.detail.value), 10) || 10)}
+                style={{ marginTop: 8 }}
+              >
+                {[5, 10, 15, 20].map((n) => (
+                  <IonSegmentButton key={n} value={String(n)}>
+                    <IonLabel>{n}</IonLabel>
+                  </IonSegmentButton>
+                ))}
+              </IonSegment>
+              <IonButton expand="block" style={{ marginTop: 12 }} onClick={() => void generateSuggestions()} disabled={suggestLoading}>
+                <IonIcon icon={sparklesOutline} slot="start" />
+                {suggestLoading ? 'Analyse en cours...' : 'Générer les suggestions'}
+              </IonButton>
+              {suggestLoading && (
+                <div style={{ textAlign: 'center', padding: 16 }}>
+                  <IonSpinner />
+                  <p>
+                    <IonText color="medium">Gemini explore ta collection...</IonText>
+                  </p>
+                </div>
+              )}
+              {!!suggestError && (
+                <p>
+                  <IonText color="danger">{suggestError}</IonText>
+                </p>
+              )}
+              {!settings.geminiApiKey && !suggestLoading && (
+                <p>
+                  <IonText color="warning">
+                    {'Ajoute ta clé API Gemini dans Réglages > IA Gemini (gratuite sur aistudio.google.com/apikey).'}
+                  </IonText>
+                </p>
+              )}
+            </div>
+            {suggestions.length > 0 && (
+              <IonList>
+                {suggestions.map((rec, i) => (
+                  <IonItem key={`${rec.title}-${i}`}>
+                    <IonLabel>
+                      <h2 style={{ whiteSpace: 'normal' }}>
+                        {rec.title}
+                        {rec.year ? ` (${rec.year})` : ''}
+                      </h2>
+                      <p>
+                        <IonBadge color={rec.type === 'movie' ? 'primary' : rec.type === 'series' ? 'tertiary' : 'medium'}>
+                          {rec.type === 'movie' ? 'Film' : rec.type === 'series' ? 'Série' : 'À vérifier'}
+                        </IonBadge>
+                      </p>
+                      {!!rec.reason && (
+                        <p style={{ whiteSpace: 'normal' }}>
+                          <IonText color="medium">{rec.reason}</IonText>
+                        </p>
+                      )}
+                      <div style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+                        <IonButton
+                          size="small"
+                          fill="outline"
+                          onClick={() => {
+                            requestBrowserOpen(buildAllocineUrl(rec.year ? `${rec.title} ${rec.year}` : rec.title));
+                            setShowSuggest(false);
+                            history.push('/browser');
+                          }}
+                        >
+                          <IonIcon icon={filmOutline} slot="start" />
+                          Allociné
+                        </IonButton>
+                        <IonButton
+                          size="small"
+                          onClick={() => void searchTorrentsFor(rec, i)}
+                          disabled={dlLoading === i}
+                        >
+                          <IonIcon icon={downloadOutline} slot="start" />
+                          {dlResults[i] !== undefined ? 'Masquer' : 'Télécharger'}
+                        </IonButton>
+                      </div>
+                      {dlLoading === i && (
+                        <div style={{ padding: '8px 0' }}>
+                          <IonSpinner style={{ width: 18, height: 18 }} />
+                          <IonText color="medium"> Recherche sur TR4KER...</IonText>
+                        </div>
+                      )}
+                      {!!dlError[i] && (
+                        <p style={{ whiteSpace: 'normal' }}>
+                          <IonText color="danger">{dlError[i]}</IonText>
+                        </p>
+                      )}
+                      {dlResults[i] !== undefined && (
+                        <div style={{ marginTop: 4 }}>
+                          {dlResults[i].length === 0 ? (
+                            <p style={{ whiteSpace: 'normal' }}>
+                              <IonText color="medium">Aucun torrent trouvé sur TR4KER pour ce titre.</IonText>
+                            </p>
+                          ) : (
+                            dlResults[i].slice(0, 8).map((f) => (
+                              <div
+                                key={f.slug}
+                                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderTop: '1px solid var(--ion-color-light-shade, #eee)' }}
+                              >
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{ fontSize: 13, whiteSpace: 'normal', wordBreak: 'break-word' }}>{f.name}</div>
+                                  <IonText color="medium">
+                                    <small>
+                                      {formatBytes(f.sizeBytes)} • {f.seeders} seeders
+                                      {f.isFreeleech ? ' • Freeleech' : ''}
+                                    </small>
+                                  </IonText>
+                                </div>
+                                <IonButton
+                                  size="small"
+                                  fill={sendingSlug === f.slug ? 'outline' : 'solid'}
+                                  disabled={sendingSlug !== null}
+                                  onClick={() => void sendSuggestionTorrent(f, rec)}
+                                >
+                                  <IonIcon icon={downloadOutline} slot="start" />
+                                  {sendingSlug === f.slug ? '...' : 'OK'}
+                                </IonButton>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </IonLabel>
+                  </IonItem>
+                ))}
+              </IonList>
+            )}
+            {!!dlMsg && (
+              <div style={{ padding: '4px 16px 12px' }}>
+                <IonText color="medium">
+                  <p style={{ whiteSpace: 'normal' }}>{dlMsg}</p>
+                </IonText>
+              </div>
+            )}
+          </IonContent>
+          <IonFooter>
+            <IonToolbar>
+              <IonButton expand="block" fill="clear" onClick={() => void generateSuggestions()} disabled={suggestLoading}>
+                <IonIcon icon={refreshOutline} slot="start" />
+                Relancer avec d'autres idées
+              </IonButton>
+            </IonToolbar>
+          </IonFooter>
+        </IonModal>
         <PlayerPicker
           isOpen={showPlayerPicker}
           title={selectedItem?.title ?? 'Choisir un lecteur'}

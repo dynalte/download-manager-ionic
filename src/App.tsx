@@ -2,11 +2,12 @@ import React, { useEffect } from 'react';
 import { IonApp, IonRouterOutlet, IonTabs, IonTabBar, IonTabButton, IonIcon, IonLabel } from '@ionic/react';
 import { IonReactRouter } from '@ionic/react-router';
 import { Redirect, Route } from 'react-router-dom';
-import { globeOutline, arrowDownCircleOutline, layersOutline, compassOutline, notificationsOutline } from 'ionicons/icons';
+import { globeOutline, arrowDownCircleOutline, layersOutline, compassOutline, notificationsOutline, filmOutline } from 'ionicons/icons';
 
 import SiteTab from './pages/SiteTab';
 import TransmissionTab from './pages/TransmissionTab';
 import PlexTab from './pages/PlexTab';
+import FilmsTab from './pages/FilmsTab';
 import BrowserTab from './pages/BrowserTab';
 import SeriesWatchTab, { runLaunchCheck } from './pages/SeriesWatchTab';
 
@@ -28,6 +29,9 @@ const App: React.FC = () => {
             </Route>
             <Route exact path="/plex">
               <PlexTab />
+            </Route>
+            <Route exact path="/films">
+              <FilmsTab />
             </Route>
             <Route exact path="/browser">
               <BrowserTab />
@@ -51,6 +55,10 @@ const App: React.FC = () => {
             <IonTabButton tab="plex" href="/plex">
               <IonIcon icon={layersOutline} />
               <IonLabel>Plex</IonLabel>
+            </IonTabButton>
+            <IonTabButton tab="films" href="/films">
+              <IonIcon icon={filmOutline} />
+              <IonLabel>Films</IonLabel>
             </IonTabButton>
             <IonTabButton tab="browser" href="/browser">
               <IonIcon icon={compassOutline} />

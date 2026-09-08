@@ -206,6 +206,24 @@ async function cleanupCacheFile(path: string): Promise<void> {
 }
 
 /**
+ * Filesystem.getUri() renvoie une URI percent-encodée
+ * (ex: file:///.../Mon%20Livre.epub). Or cordova-plugin-email-composer
+ * (iOS dataForAbsolutePath / Android getUriForAbsolutePath) fait
+ * `new File(path)` SANS décoder : le fichier n'est pas trouvé, `data`
+ * vaut nil et la PJ est ignorée silencieusement (`if (!data) continue`).
+ * D'où un mail qui s'ouvre sans pièce jointe dès que le nom contient un
+ * espace/accent. On décode donc avant de passer au composeur.
+ */
+export function toEmailAttachmentPath(uri: string): string {
+  const clean = uri.split('#')[0].split('?')[0];
+  try {
+    return decodeURI(clean);
+  } catch {
+    return clean;
+  }
+}
+
+/**
  * Envoie le fichier d'un téléchargement terminé par e-mail au destinataire.
  * Natif : composeur Mail (PJ) ou feuille de partage en repli.
  * Web/exe : téléchargement navigateur + mailto pré-rempli (sans PJ possible).
@@ -246,6 +264,8 @@ export async function sendBookByEmail(
   let uri: string;
   try {
     uri = (await Filesystem.getUri({ path, directory: Directory.Cache })).uri;
+    // Échec d'écriture silencieux -> le composeur ouvrirait un mail sans PJ.
+    await Filesystem.stat({ path, directory: Directory.Cache });
   } catch {
     await cleanupCacheFile(path);
     throw new BookShareError('Impossible de préparer la pièce jointe.');
@@ -261,7 +281,8 @@ export async function sendBookByEmail(
             subject: `[Livre] ${item.name}`,
             body: `Envoi depuis Download Manager : ${item.name}`,
             isHtml: false,
-            attachments: [uri],
+            // Chemin décodé : voir toEmailAttachmentPath (espaces/accents).
+            attachments: [toEmailAttachmentPath(uri)],
           },
           (result) => resolve(String(result ?? 'closed')),
         );

@@ -4,6 +4,9 @@ release/
 electron-dist/
 /ios/
 android/
+# ... sauf le code source du plugin natif (la plateforme générée android/ reste ignorée)
+!plugins/inline-browser/android/
+plugins/inline-browser/android/build/
 .plugins/
 .opencode/
 *.log

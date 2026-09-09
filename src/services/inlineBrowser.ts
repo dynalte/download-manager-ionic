@@ -1,7 +1,7 @@
 /**
- * Wrapper du plugin natif InlineBrowser (iOS uniquement).
+ * Wrapper du plugin natif InlineBrowser (iOS + Android).
  *
- * Affiche TR4KER dans une WKWebView positionnée sur le conteneur de
+ * Affiche TR4KER dans une WebView native positionnée sur le conteneur de
  * l'onglet Site, au lieu d'une modale plein écran par-dessus l'app.
  * Les messages de l'intercepteur JS (INTERCEPTOR_WKWEBVIEW_JS) arrivent
  * via l'event "browserMessage", les navigations magnet:/.torrent via

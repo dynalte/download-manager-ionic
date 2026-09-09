@@ -58,9 +58,9 @@ const SiteTab: React.FC = () => {
   const browserRef = useRef<{ close: () => Promise<void> } | null>(null);
   // Exe Windows : le site est affiché inline dans l'onglet (balise <webview>).
   const isElectron = useRef(isDesktopElectron()).current;
-  // iOS natif : TR4KER affiché inline dans l'onglet (plugin InlineBrowser,
-  // WKWebView positionnée sur le conteneur). Autres natifs : modale plein écran.
-  const useInlineTr4ker = useRef(Capacitor.getPlatform() === 'ios').current;
+  // Natif iOS/Android : TR4KER affiché inline dans l'onglet (plugin
+  // InlineBrowser, WebView positionnée sur le conteneur). Autres : modale plein écran.
+  const useInlineTr4ker = useRef(Capacitor.getPlatform() === 'ios' || Capacitor.getPlatform() === 'android').current;
   const inlineContainerRef = useRef<HTMLDivElement>(null);
   const inlineOpenedRef = useRef(false);
   const inlineListenersRef = useRef<PluginListenerHandle[]>([]);
@@ -151,15 +151,38 @@ const SiteTab: React.FC = () => {
     cancelAnimationFrame(inlineRectRafRef.current);
     inlineRectRafRef.current = requestAnimationFrame(() => {
       const rect = measureInlineRect();
-      if (rect) void InlineBrowser.setRect(rect).catch(() => {});
+      // Entiers : le pont natif Android attend des int (les doubles
+      // getBoundingClientRect ne doivent pas traverser tels quels).
+      if (rect) {
+        const intRect = {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+        void InlineBrowser.setRect(intRect).catch(() => {});
+      }
     });
   }
 
-  /** Ouvre TR4KER inline dans l'onglet (iOS). Échec -> écran de secours avec modale.
+  /** Attend que le conteneur ait une taille (le layout Ionic arrive après
+      l'entrée sur l'onglet, surtout sur Android : une seule frame ne suffit
+      pas, sinon la WebView native naît à 0x0 et reste invisible). */
+  async function waitForInlineRect(): Promise<{ x: number; y: number; width: number; height: number } | null> {
+    for (let i = 0; i < 40; i++) {
+      const rect = measureInlineRect();
+      if (rect) return rect;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    return measureInlineRect();
+  }
+
+  /** Ouvre TR4KER inline dans l'onglet (iOS/Android). Échec -> écran de secours avec modale.
       La vue est créée une seule fois puis conservée (jamais détruite) : la
       session TR4KER (cookies + sessionStorage + état SPA) survit aux
       changements d'onglet et à la fiche dossier. */
-  /** Injection de l'intercepteur en secours (l'injection auto WKUserScript couvre déjà main + iframes). */
+  /** Injection de l'intercepteur en secours (l'injection auto couvre déjà main + iframes). */
   function injectInlineInterceptor() {
     void InlineBrowser.executeScript({ code: INTERCEPTOR_WKWEBVIEW_JS }).catch(() => {});
   }
@@ -174,14 +197,24 @@ const SiteTab: React.FC = () => {
     setInlineFailed(false);
     setErrorMessage('');
     try {
-      // Attend la mise en page pour mesurer le conteneur.
-      await new Promise((res) => requestAnimationFrame(() => res(null)));
-      const rect = measureInlineRect();
-      if (!rect) throw new Error('Conteneur TR4KER non mesurable');
+      // Attend la mise en page pour mesurer le conteneur (poll : 1 frame
+      // ne suffit pas sur Android).
+      const measured = await waitForInlineRect();
+      if (!measured) throw new Error('Conteneur TR4KER non mesurable');
+      const rect = {
+        x: Math.round(measured.x),
+        y: Math.round(measured.y),
+        width: Math.round(measured.width),
+        height: Math.round(measured.height),
+      };
       // injectScript : pièges armés par la WebView elle-même (main + iframes),
       // avant tout clic possible (la réinjection load reste en secours).
       await InlineBrowser.open({ url: TR4KER_URL, injectScript: INTERCEPTOR_WKWEBVIEW_JS, ...rect });
       inlineOpenedRef.current = true;
+      // Le layout peut encore bouger après l'ouverture : re-synchronise
+      // quand la mise en page est stabilisée.
+      window.setTimeout(() => scheduleInlineRectSync(), 500);
+      window.setTimeout(() => scheduleInlineRectSync(), 1500);
       const cbs = tr4kerCallbacks(false);
       inlineListenersRef.current = [
         await InlineBrowser.addListener('browserMessage', (msg) => {
@@ -196,6 +229,9 @@ const SiteTab: React.FC = () => {
         }),
         await InlineBrowser.addListener('load', (state) => {
           setInlineState(state);
+          // La page est chargée donc le layout Ionic est stable : réaligne
+          // la vue native (corrige une ouverture faite sur un rect à 0).
+          scheduleInlineRectSync();
           void (async () => {
             // 1er chargement : restaure la session sauvegardée puis recharge
             // (une fois) avant d'injecter l'intercepteur.
@@ -458,7 +494,7 @@ const SiteTab: React.FC = () => {
   }
 
   // Mobile : le site s'ouvre directement à l'entrée sur l'onglet, sans bouton.
-  // iOS : inline dans l'onglet (plugin InlineBrowser). Autres natifs : modale.
+  // iOS/Android : inline dans l'onglet (plugin InlineBrowser). Autres natifs : modale.
   useIonViewDidEnter(() => {
     if (isElectron || !Capacitor.isNativePlatform()) return;
     if (useInlineTr4ker) {
@@ -471,7 +507,7 @@ const SiteTab: React.FC = () => {
     void openEmbedded();
   });
 
-  // iOS inline : sauvegarde périodique + à la mise en fond du storage TR4KER
+  // Inline natif : sauvegarde périodique + à la mise en fond du storage TR4KER
   // (le sessionStorage ne survit pas au kill de l'app).
   useEffect(() => {
     if (!useInlineTr4ker) return;
@@ -491,7 +527,7 @@ const SiteTab: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [useInlineTr4ker]);
 
-  // iOS inline : suit les changements de mise en page (rotation, clavier)
+  // Inline natif : suit les changements de mise en page (rotation, clavier)
   // pour garder la vue native alignée sur le conteneur.
   useEffect(() => {
     if (!useInlineTr4ker) return;
@@ -510,7 +546,7 @@ const SiteTab: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [useInlineTr4ker]);
 
-  // iOS inline : la vue native recouvre la WebView Ionic, donc aussi la fiche
+  // Inline natif : la vue native recouvre la WebView Ionic, donc aussi la fiche
   // dossier. On la masque (sans la détruire : la page reste chargée) quand la
   // fiche s'ouvre, on la restore à la fermeture.
   useEffect(() => {
@@ -798,7 +834,7 @@ const SiteTab: React.FC = () => {
             )}
           </div>
         ) : useInlineTr4ker ? (
-          /* iOS natif : TR4KER seul, plein onglet (fiche dossier + toast en overlays).
+          /* Natif iOS/Android : TR4KER seul, plein onglet (fiche dossier + toast en overlays).
              Pas de barre d'URL ni de statut : l'onglet ne contient que le site. */
           <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             {inlineFailed && (

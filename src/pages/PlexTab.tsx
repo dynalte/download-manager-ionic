@@ -44,11 +44,14 @@ import {
 import { settings, Keys, transmissionPath } from '../services/settings';
 import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
 import { fetchGeminiRecommendations, type GeminiRecommendation } from '../services/gemini';
+import { fetchOpenRouterRecommendations } from '../services/openrouter';
 import { searchTorrents, downloadFilmTorrent, formatBytes, type DiscoveryFilm } from '../services/tr4kerDiscovery';
 import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
-import { loadSeenSuggestions, markSeenSuggestion, seenKeyFor, seenKeys, type SeenSuggestion } from '../services/seenSuggestions';
+import { loadSeenSuggestions, seenKeyFor, seenKeys, type SeenSuggestion } from '../services/seenSuggestions';
+import { loadSeenMerged, markSeenEverywhere } from '../services/seenSync';
 import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
+import { pushSubscription } from '../services/seriesSync';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { isDesktopElectron } from '../services/embeddedBrowser';
 import SettingsModal from '../components/SettingsModal';
@@ -229,8 +232,10 @@ const PlexTab: React.FC = () => {
   }, [libraries, filteredLibraries]);
 
   async function generateSuggestions() {
-    if (!settings.geminiApiKey) {
-      setSuggestError('Clé API Gemini manquante : ouvre Réglages > IA Gemini (clé gratuite sur aistudio.google.com/apikey).');
+    // Provider IA : OpenRouter si sa clé est renseignée, sinon Gemini.
+    const useOpenRouter = settings.openrouterApiKey !== '';
+    if (!useOpenRouter && !settings.geminiApiKey) {
+      setSuggestError('Clé API manquante : ouvre Réglages > IA OpenRouter (clé gratuite sur openrouter.ai/keys) ou IA Gemini.');
       return;
     }
     setSuggestLoading(true);
@@ -261,11 +266,12 @@ const PlexTab: React.FC = () => {
       );
       if (entries.length === 0) throw new Error('Librairie Plex vide.');
       // Historique de visionnage (vus même supprimés) + titres marqués « déjà vu » :
-      // best effort, exclus des suggestions (prompt Gemini + filtre local).
+      // best effort, exclus des suggestions (prompt IA + filtre local).
+      // Les « déjà vu » fusionnent local + serveur SQLite si synchro configurée.
       let history: { title: string; year?: string; type: string }[] = [];
-      let seen = seenList;
+      let seen: SeenSuggestion[] = seenList;
       try {
-        seen = loadSeenSuggestions();
+        seen = await loadSeenMerged();
         setSeenList(seen);
       } catch {
         /* repli : état en mémoire */
@@ -274,7 +280,7 @@ const PlexTab: React.FC = () => {
         history = await fetchWatchHistory(
           settings.plexResolvedBaseURL,
           settings.plexToken,
-          500,
+          300,
         );
       } catch {
         history = [];
@@ -282,13 +288,37 @@ const PlexTab: React.FC = () => {
       setSuggestHistoryCount(history.length);
       const seenEntries = seen.map((s) => ({ title: s.t, year: s.y, type: 'unknown' }));
       const intent = semanticQuery.trim();
-      const recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+      const opts = {
         count: suggestCount,
         want: suggestWant,
-        model: settings.geminiModel,
         intent: intent || undefined,
         history: [...history, ...seenEntries],
-      });
+      };
+      let recs;
+      if (useOpenRouter) {
+        try {
+          recs = await fetchOpenRouterRecommendations(settings.openrouterApiKey, entries, {
+            ...opts,
+            model: settings.openrouterModel,
+          });
+        } catch (e) {
+          // Repli inter-provider sur quota/réseau/serveur : OpenRouter :free saturé → Gemini.
+          // (Pas de repli sur clé invalide ou résultat vide : l'erreur reste affichée.)
+          const msg = e instanceof Error ? e.message : String(e);
+          const fallbackable = /429|402|injoignable|délai dépassé|ne répond pas|HTTP 5\d\d/i.test(msg);
+          if (!settings.geminiApiKey || !fallbackable) throw e;
+          recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+            ...opts,
+            model: settings.geminiModel,
+          });
+          setDlMsg('OpenRouter saturé : génération via Gemini.');
+        }
+      } else {
+        recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+          ...opts,
+          model: settings.geminiModel,
+        });
+      }
       // Filet local : exclut les « déjà vu » même si Gemini les renvoie.
       const seenSet = seenKeys(seen);
       setSuggestions(recs.filter((r) => !seenSet.has(seenKeyFor(r.title))));
@@ -304,12 +334,13 @@ const PlexTab: React.FC = () => {
     await generateSuggestions();
   }
 
-  /** Marque une suggestion comme déjà vue : persistée + retirée de la liste. */
+  /** Marque une suggestion comme déjà vue : persistée (local + serveur) + retirée de la liste. */
   function markSuggestionSeen(rec: GeminiRecommendation) {
-    const next = markSeenSuggestion(rec.title, rec.year);
-    setSeenList(next);
-    const keys = seenKeys(next);
-    setSuggestions((prev) => prev.filter((r) => !keys.has(seenKeyFor(r.title))));
+    void markSeenEverywhere(rec.title, rec.year).then((next) => {
+      setSeenList(next);
+      const keys = seenKeys(next);
+      setSuggestions((prev) => prev.filter((r) => !keys.has(seenKeyFor(r.title))));
+    });
   }
 
   function suggestRatingKey(rec: GeminiRecommendation): string {
@@ -522,7 +553,7 @@ const PlexTab: React.FC = () => {
       const query = buildAllocineQuery(item.title) || item.title;
       const base =
         maxS > 0 ? `S${String(maxS).padStart(2, '0')}E${String(maxE).padStart(2, '0')}` : 'aucun épisode';
-      upsertSubscription({
+      const sub = {
         id: subscriptionIdFor(item.title, item.year),
         title: item.title,
         query,
@@ -534,7 +565,9 @@ const PlexTab: React.FC = () => {
         createdAt: Date.now(),
         lastCheckAt: 0,
         lastResult: `Base Plex : ${base}`,
-      });
+      };
+      upsertSubscription(sub);
+      void pushSubscription(sub);
       setPlaybackMsg(`Suivi activé : ${item.title} (base ${base}). Voir l’onglet Suivis.`);
     } catch (e) {
       setPlaybackMsg(`Suivi impossible : ${e instanceof Error ? e.message : String(e)}`);
@@ -900,7 +933,7 @@ const PlexTab: React.FC = () => {
             <div className="detail-sheet">
               <IonText color="medium">
                 <p style={{ marginTop: 0 }}>
-                  Gemini analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération{suggestHistoryCount > 0 ? ` + ${suggestHistoryCount} vus (historique, même supprimés)` : ''}{seenList.length > 0 ? ` + ${seenList.length} marqués vus` : ''}) pour proposer des films/séries ni en collection ni déjà vus.
+                  {settings.openrouterApiKey !== '' ? 'OpenRouter' : 'Gemini'} analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération{suggestHistoryCount > 0 ? ` + ${suggestHistoryCount} vus (historique, même supprimés)` : ''}{seenList.length > 0 ? ` + ${seenList.length} marqués vus` : ''}) pour proposer des films/séries ni en collection ni déjà vus.
                 </p>
               </IonText>
               <IonSegment
@@ -956,10 +989,10 @@ const PlexTab: React.FC = () => {
                   <IonText color="danger">{suggestError}</IonText>
                 </p>
               )}
-              {!settings.geminiApiKey && !suggestLoading && (
+              {!settings.geminiApiKey && !settings.openrouterApiKey && !suggestLoading && (
                 <p>
                   <IonText color="warning">
-                    {'Ajoute ta clé API Gemini dans Réglages > IA Gemini (gratuite sur aistudio.google.com/apikey).'}
+                    {'Ajoute ta clé API dans Réglages > IA OpenRouter (gratuite sur openrouter.ai/keys, modèles :free) ou IA Gemini.'}
                   </IonText>
                 </p>
               )}

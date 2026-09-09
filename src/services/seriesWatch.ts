@@ -126,6 +126,15 @@ export function removeSubscription(id: string): SeriesSubscription[] {
   return subs;
 }
 
+/** Remplace toute la liste (fusion serveur). Retourne la liste normalisée. */
+export function replaceSubscriptions(list: SeriesSubscription[]): SeriesSubscription[] {
+  const next = (Array.isArray(list) ? list : []).filter(
+    (s) => s && typeof s.id === 'string' && typeof s.title === 'string',
+  );
+  saveSubscriptions(next);
+  return next;
+}
+
 export function subscriptionIdFor(title: string, year?: string | number | null): string {
   return `${norm(title)}|${String(year ?? '').trim()}`.slice(0, 120) || `sub-${Date.now()}`;
 }

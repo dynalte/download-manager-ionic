@@ -30,6 +30,12 @@ import {
   type SeriesSubscription,
 } from '../services/seriesWatch';
 import { settings } from '../services/settings';
+import {
+  loadSubscriptionsMerged,
+  pushAllSubscriptions,
+  pushSubscription,
+  removeSubscriptionOnServer,
+} from '../services/seriesSync';
 import SettingsModal from '../components/SettingsModal';
 
 function fmtSE(sub: SeriesSubscription): string {
@@ -44,7 +50,10 @@ const SeriesWatchTab: React.FC = () => {
   const [toast, setToast] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
-  const refresh = useCallback(() => setSubs(loadSubscriptions()), []);
+  const refresh = useCallback(() => {
+    // Recharge + fusionne avec le serveur (repousse la fusion) ; repli local si hors ligne.
+    void loadSubscriptionsMerged().then(setSubs);
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -74,6 +83,7 @@ const SeriesWatchTab: React.FC = () => {
     } finally {
       setChecking(false);
       refresh();
+      void pushAllSubscriptions();
     }
   }
 
@@ -154,7 +164,10 @@ const SeriesWatchTab: React.FC = () => {
                       s.id === sub.id ? { ...s, enabled: e.detail.checked } : s,
                     );
                     const updated = next.find((s) => s.id === sub.id);
-                    if (updated) upsertSubscription(updated);
+                    if (updated) {
+                      upsertSubscription(updated);
+                      void pushSubscription(updated);
+                    }
                     refresh();
                   }}
                 />
@@ -184,6 +197,7 @@ const SeriesWatchTab: React.FC = () => {
                   slot="end"
                   onClick={() => {
                     removeSubscription(sub.id);
+                    void removeSubscriptionOnServer(sub.id);
                     refresh();
                   }}
                 >
@@ -207,6 +221,7 @@ export async function runLaunchCheck(): Promise<void> {
     if (!settings.tr4kerApiKey || !isGlobalCheckDue()) return;
     if (loadSubscriptions().every((s) => !s.enabled)) return;
     await checkAllSubscriptions(settings.tr4kerApiKey);
+    void pushAllSubscriptions();
   } catch {
     /* silencieux */
   }

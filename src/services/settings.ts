@@ -27,6 +27,10 @@ export const Keys = {
   plexDisplayMode: 'plex_display_mode',
   geminiApiKey: 'gemini_api_key',
   geminiModel: 'gemini_model',
+  openrouterApiKey: 'openrouter_api_key',
+  openrouterModel: 'openrouter_model',
+  seenSyncURL: 'seen_sync_url',
+  seenSyncToken: 'seen_sync_token',
 } as const;
 
 export const DEFAULT_FOLDER_FILMS = '/downloads/films';
@@ -173,6 +177,23 @@ export const settings = {
       return 'gemini-2.5-flash';
     }
     return stored;
+  },
+  /** Clé API OpenRouter (modèles :free, sans CB). Vide = provider désactivé. */
+  get openrouterApiKey(): string {
+    return getString(Keys.openrouterApiKey, '').trim();
+  },
+  get openrouterModel(): string {
+    const stored = getString(Keys.openrouterModel, '').trim();
+    return stored === '' ? 'google/gemma-4-26b-a4b-it:free' : stored;
+  },
+  /** URL de l'API perso de synchro des « déjà vu » (vide = synchro désactivée). */
+  get seenSyncURL(): string {
+    const stored = getString(Keys.seenSyncURL, '').trim().replace(/\/+$/, '');
+    return stored === '' ? 'http://photos2.dynaspirit.com:8080/api-download-manager.php' : stored;
+  },
+  /** Token partagé avec API_TOKEN côté PHP. Vide = synchro désactivée. */
+  get seenSyncToken(): string {
+    return getString(Keys.seenSyncToken, '').trim();
   },
 };
 

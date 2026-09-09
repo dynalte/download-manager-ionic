@@ -72,3 +72,19 @@ export function clearSeenSuggestions(): void {
     /* ignore */
   }
 }
+
+/** Remplace toute la liste (fusion serveur). Retourne la liste normalisée. */
+export function replaceSeenSuggestions(list: SeenSuggestion[]): SeenSuggestion[] {
+  const seen = new Set<string>();
+  const next: SeenSuggestion[] = [];
+  for (const s of list) {
+    if (!s || typeof s.t !== 'string' || s.t.trim() === '') continue;
+    const k = seenKeyFor(s.t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    next.push({ t: s.t.trim(), y: typeof s.y === 'string' ? s.y.trim() || undefined : undefined, at: typeof s.at === 'number' ? s.at : Date.now() });
+    if (next.length >= SEEN_MAX) break;
+  }
+  saveSeen(next);
+  return next;
+}

@@ -55,9 +55,19 @@ export const RETIRED_GEMINI_MODELS = new Set([
 /** Ordre d'essai si le modèle demandé répond 404 (retiré / renommé). */
 const GEMINI_MODEL_FALLBACKS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro', 'gemini-3.5-flash'];
 const GEMINI_TIMEOUT_MS = 60000;
-const MAX_TITLES_IN_PROMPT = 400;
+// Prompts volontairement courts : l'input volumineux est la 1re cause de lenteur.
+const MAX_TITLES_IN_PROMPT = 150;
 
 export class GeminiError extends Error {}
+
+/** Échec récupérable : passer au modèle suivant (troncature → un autre modèle peut passer). */
+class GeminiRetryable extends GeminiError {
+  truncated: boolean;
+  constructor(message: string, opts: { truncated?: boolean } = {}) {
+    super(message);
+    this.truncated = opts.truncated ?? false;
+  }
+}
 
 function normalizeType(t: string): string {
   const v = (t || '').toLowerCase();
@@ -88,7 +98,7 @@ export function summarizeLibraryForPrompt(entries: GeminiLibraryEntry[]): string
   return parts.join('\n\n');
 }
 
-const MAX_HISTORY_IN_PROMPT = 200;
+const MAX_HISTORY_IN_PROMPT = 100;
 
 /** Déduplique + tronque l'historique de visionnage (vus même supprimés). */
 export function summarizeHistoryForPrompt(entries: GeminiLibraryEntry[]): string {
@@ -256,8 +266,8 @@ function extractBalanced(text: string): string[] {
   return out.sort((a, b) => b.length - a.length);
 }
 
-/** Extrait le JSON même si Gemini ajoute du texte / un bloc ```json autour. */
-function extractJson(text: string): unknown {
+/** Extrait le JSON même si le modèle ajoute du texte / un bloc ```json autour. */
+export function extractJson(text: string): unknown {
   const clean = (text || '').trim();
   if (!clean) throw new GeminiError('Réponse vide de Gemini.');
   // 1) Blocs ```json ... ``` (le modèle en met souvent malgré la consigne).
@@ -285,7 +295,7 @@ function extractJson(text: string): unknown {
 }
 
 /** Normalise un titre pour l'anti-doublon (accents, casse, ponctuation, &/and). */
-function normTitle(s: string): string {
+export function normTitle(s: string): string {
   return (s || '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -295,7 +305,7 @@ function normTitle(s: string): string {
     .trim();
 }
 
-function normalizeRecommendation(raw: Record<string, unknown>): GeminiRecommendation | null {
+export function normalizeRecommendation(raw: Record<string, unknown>): GeminiRecommendation | null {
   const title = String(raw['title'] ?? raw['titre'] ?? '').trim();
   if (!title) return null;
   const yearRaw = String(raw['year'] ?? raw['annee'] ?? raw['année'] ?? '').trim();
@@ -327,31 +337,38 @@ export async function fetchGeminiRecommendations(
   const key = (apiKey || '').trim();
   if (!key) throw new GeminiError('Clé API Gemini manquante (Réglages > IA Gemini).');
   if (library.length === 0) throw new GeminiError('Librairie Plex vide : impossible de générer des suggestions.');
+  const t0 = Date.now();
   let requested = (options.model || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
   // Migration auto : un modèle retiré stocké en réglages bascule sur le défaut.
   if (RETIRED_GEMINI_MODELS.has(requested)) requested = DEFAULT_GEMINI_MODEL;
   const summary = summarizeLibraryForPrompt(library);
   const prompt = buildGeminiPrompt(summary, library.length, options);
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.8, maxOutputTokens: 2048, responseMimeType: 'application/json' },
-  });
+  // Plafond de sortie proportionné au nombre demandé : borne le pire cas (latence)
+  // tout en laissant la marge pour le raisonnement interne (thinking) + 10 recs.
+  const outTokens = Math.min(8192, Math.max(2048, (options.count ?? 10) * 350));
   // Modèle demandé + replis, sans doublon.
   const candidates = [requested, ...GEMINI_MODEL_FALLBACKS.filter((m) => m !== requested)];
   let last404 = '';
-  const buildBody = (jsonMode: boolean) =>
+  let lastTruncated = '';
+  // Pas de raisonnement interne : la tâche est un JSON direct, le thinking
+  // consomme le budget de sortie (troncatures) et ralentit. Supporté par 2.5-flash/lite.
+  const noThinkingFor = (model: string) => model.startsWith('gemini-2.5-flash');
+  const buildBody = (model: string, jsonMode: boolean) =>
     JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: jsonMode
-        ? { temperature: 0.8, maxOutputTokens: 4096, responseMimeType: 'application/json' }
-        : { temperature: 0.8, maxOutputTokens: 4096 },
+      generationConfig: {
+        temperature: 0.8,
+        maxOutputTokens: outTokens,
+        ...(jsonMode ? { responseMimeType: 'application/json' } : {}),
+        ...(noThinkingFor(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+      },
     });
   const callModel = async (model: string, jsonMode: boolean): Promise<Response> => {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
     try {
       return await fetchWithTimeout(
         url,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: buildBody(jsonMode) },
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: buildBody(model, jsonMode) },
         GEMINI_TIMEOUT_MS,
       );
     } catch (e) {
@@ -369,7 +386,7 @@ export async function fetchGeminiRecommendations(
   const textFrom = (data: {
     candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
     promptFeedback?: { blockReason?: string };
-  }): string => {
+  }, model: string): string => {
     const block = data.promptFeedback?.blockReason;
     if (block) throw new GeminiError(`Gemini a bloqué la demande (${block}). Réessaie avec une collection plus petite.`);
     const cand = data.candidates?.[0];
@@ -380,8 +397,9 @@ export async function fetchGeminiRecommendations(
     const text = texts.join('').trim();
     const finish = cand?.finishReason;
     if (finish === 'MAX_TOKENS') {
-      throw new GeminiError(
-        'Réponse Gemini tronquée (limite de longueur atteinte). Relance en demandant moins de suggestions (5 au lieu de 10/20).',
+      throw new GeminiRetryable(
+        `Réponse Gemini tronquée par ${model} (limite de longueur atteinte).`,
+        { truncated: true },
       );
     }
     if (!text) {
@@ -395,6 +413,7 @@ export async function fetchGeminiRecommendations(
     return text;
   };
   for (const model of candidates) {
+    try {
     let res = await callModel(model, true);
     if (res.status === 404) {
       last404 = model;
@@ -414,7 +433,7 @@ export async function fetchGeminiRecommendations(
       candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
       promptFeedback?: { blockReason?: string };
     };
-    let text = textFrom(data);
+    let text = textFrom(data, model);
     let parsed: unknown;
     try {
       parsed = extractJson(text);
@@ -424,7 +443,7 @@ export async function fetchGeminiRecommendations(
       res = await callModel(model, false);
       if (!res.ok) throw new GeminiError(`Gemini a retourné HTTP ${res.status}.`);
       data = (await res.json()) as typeof data;
-      text = textFrom(data);
+      text = textFrom(data, model);
       parsed = extractJson(text); // si ça échoue, l'erreur contient un extrait
     }
     const list = Array.isArray(parsed) ? parsed : (parsed as { recommendations?: unknown })['recommendations'];
@@ -442,7 +461,25 @@ export async function fetchGeminiRecommendations(
       out.push(rec);
     }
     if (out.length === 0) throw new GeminiError('Gemini n’a proposé que des titres déjà dans ta collection ou déjà vus. Relance la génération.');
+    try {
+      if (typeof console !== 'undefined') console.info(`[gemini] suggestions via ${model} en ${Date.now() - t0} ms`);
+    } catch {
+      /* ignore */
+    }
     return out;
+    } catch (e) {
+      // Troncature : un autre modèle (sans thinking gourmand) peut passer.
+      if (e instanceof GeminiRetryable && e.truncated) {
+        lastTruncated = model;
+        continue;
+      }
+      throw e;
+    }
+  }
+  if (lastTruncated && !last404) {
+    throw new GeminiError(
+      `Réponse Gemini tronquée par ${lastTruncated} (limite de longueur atteinte). Relance en demandant moins de suggestions (5 au lieu de 10).`,
+    );
   }
   throw new GeminiError(
     `Aucun modèle Gemini joignable (dernier essai "${last404}" → 404). Modèles testés : ${candidates.join(', ')}. ` +

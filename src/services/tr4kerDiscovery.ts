@@ -2,8 +2,11 @@
  * Découverte de films via l'API TR4KER (mêmes appels que le front
  * tr4ker.net, extraits de son bundle public : pas de doc officielle).
  *
- * Listing : GET /api/torrents?cat=films&period=day|week|month|all
- *           &sort=seeders&limit=25&page=1 (+q=... en recherche)
+ * Listing : GET /api/torrents?cat=films&period=day|week|month (+q=... en recherche)
+ *           (`period` omis = tout ; `cat` omis = toutes catégories —
+ *           comme le front tr4ker.net qui n'envoie `period` que si != 'all').
+ *           Slugs exacts (GET /api/public/categories) : `films`, `series`,
+ *           `livres`, `livres-audio`, `audio`, ...
  *   Variantes : tri `recent` (défaut sans q), `size`, `name`.
  * Réponse : { torrents: [...], total, total_capped }.
  * Item utile : slug, name, size_bytes, seeders, leechers, created_at,
@@ -21,6 +24,61 @@ export const FILMS_PERIODS: Array<{ key: FilmsPeriod; label: string }> = [
   { key: 'all', label: 'Tout' },
 ];
 
+/** Portées de recherche de l'onglet Films. */
+export type DiscoveryCategoryKey = 'films' | 'series' | 'books' | 'audiobooks';
+
+export interface DiscoveryCategory {
+  key: DiscoveryCategoryKey;
+  label: string;
+  /** Slug `cat` serveur (slugs exacts : parents `series`/`livres` inclus,
+   *  `livres-audio` = sous-catégorie directe). */
+  cat: string | null;
+  /** Dossier Transmission de destination. */
+  folder: 'films' | 'series' | 'livres';
+  /** Allociné ne couvre que films + séries (notes, affiches, synopsis). */
+  allocine: boolean;
+  /** Mots-clés (normalisés) des libellés de catégorie TR4KER (filet de sécurité). */
+  matchWords: string[];
+  /** Mots qui excluent un item du filtre (ex : pas d'audio dans Livres). */
+  excludeWords?: string[];
+}
+
+export const DISCOVERY_CATEGORIES: DiscoveryCategory[] = [
+  { key: 'films', label: 'Films', cat: 'films', folder: 'films', allocine: true, matchWords: [] },
+  { key: 'series', label: 'Séries', cat: 'series', folder: 'series', allocine: true, matchWords: ['serie', 'emission', 'anime'] },
+  { key: 'books', label: 'Livres', cat: 'livres', folder: 'livres', allocine: false, matchWords: ['livre', 'ebook', 'book', 'roman', 'bd', 'manga', 'comics', 'presse', 'magazine', 'document', 'jdr'], excludeWords: ['audio'] },
+  { key: 'audiobooks', label: 'Audiobooks', cat: 'livres-audio', folder: 'livres', allocine: false, matchWords: ['audio'] },
+];
+
+export function discoveryCategory(key: string): DiscoveryCategory {
+  return DISCOVERY_CATEGORIES.find((c) => c.key === key) ?? DISCOVERY_CATEGORIES[0];
+}
+
+function normWord(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+/**
+ * Filtre client par catégorie (filet de sécurité si le serveur ignore `cat`
+ * et renvoie du mixte). Retourne la liste brute si le filtre élimine tout
+ * (on préfère afficher plutôt que masquer).
+ */
+export function filterByDiscoveryCategory(items: DiscoveryFilm[], key: DiscoveryCategoryKey): DiscoveryFilm[] {
+  const cat = discoveryCategory(key);
+  if (cat.matchWords.length === 0) return items;
+  const wanted = cat.matchWords.map(normWord);
+  const excluded = (cat.excludeWords ?? []).map(normWord);
+  const kept = items.filter((f) => {
+    const hay = normWord([f.category ?? '', f.catSlug ?? ''].join(' '));
+    if (excluded.some((w) => hay.includes(w))) return false;
+    return wanted.some((w) => hay.includes(w));
+  });
+  return kept.length > 0 ? kept : items;
+}
+
 export interface DiscoveryFilm {
   slug: string;
   name: string;
@@ -32,6 +90,8 @@ export interface DiscoveryFilm {
   sizeBytes: number;
   addedAt?: Date;
   category?: string;
+  /** Slug de catégorie brut (filtre client séries/livres/audiobooks). */
+  catSlug?: string;
   isFreeleech: boolean;
   tmdbId?: number;
 }
@@ -94,6 +154,7 @@ function normalizeItem(raw: RawItem): DiscoveryFilm | null {
     sizeBytes: toNumber(raw.size_bytes),
     addedAt,
     category: raw.sub_cat_name || raw.parent_cat_name || raw.cat_slug || undefined,
+    catSlug: raw.cat_slug || undefined,
     isFreeleech: !!raw.is_freeleech,
     tmdbId: typeof raw.tmdb_id === 'number' && raw.tmdb_id > 0 ? raw.tmdb_id : undefined,
   };
@@ -106,6 +167,11 @@ export interface FetchFilmsOptions {
   page?: number;
   /** Tri serveur : `seeders` = popularité, `recent` = nouveautés. */
   sort?: 'seeders' | 'recent';
+  /**
+   * Filtre catégorie serveur. Défaut 'films' (comportement historique).
+   * `null` = aucun filtre (recherche/listing toutes catégories).
+   */
+  cat?: string | null;
 }
 
 export interface FetchFilmsResult {
@@ -147,15 +213,16 @@ async function getJSON(url: string, apiKey: string, params: Record<string, strin
  * Filtres période : jour / semaine / mois / tout (paramètre `period` natif).
  */
 export async function fetchFilms(apiKey: string, opts: FetchFilmsOptions = {}): Promise<FetchFilmsResult> {
-  const { period = 'week', query = '', limit = 25, page = 1, sort = 'seeders' } = opts;
+  const { period = 'week', query = '', limit = 25, page = 1, sort = 'seeders', cat = 'films' } = opts;
   if (!apiKey.trim()) throw new DiscoveryError('Clé API TR4KER manquante (Réglages).');
   const params: Record<string, string> = {
-    cat: 'films',
-    period,
     sort,
     limit: String(Math.max(1, Math.min(100, limit))),
     page: String(Math.max(1, page)),
   };
+  if (cat !== null && cat.trim() !== '') params.cat = cat.trim();
+  // Comme le front tr4ker.net : `period` seulement si != 'all'.
+  if (period !== 'all') params.period = period;
   const q = query.trim();
   if (q) params.q = q;
   const parsed = (await getJSON(API_BASE, apiKey, params)) as {

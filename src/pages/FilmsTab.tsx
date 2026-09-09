@@ -35,7 +35,11 @@ import {
   markSlugAdded,
   formatBytes,
   FILMS_PERIODS,
+  DISCOVERY_CATEGORIES,
+  discoveryCategory,
+  filterByDiscoveryCategory,
   type DiscoveryFilm,
+  type DiscoveryCategoryKey,
   type FilmsPeriod,
 } from '../services/tr4kerDiscovery';
 import { settings } from '../services/settings';
@@ -58,6 +62,11 @@ const FilmsTab: React.FC = () => {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   const [period, setPeriod] = useState<FilmsPeriod>('week');
+  const [categoryKey, setCategoryKey] = useState<DiscoveryCategoryKey>(() => {
+    const v = localStorage.getItem('films_category_v1') ?? 'films';
+    return v === 'series' || v === 'books' || v === 'audiobooks' ? v : 'films';
+  });
+  const category = discoveryCategory(categoryKey);
   const [query, setQuery] = useState('');
   const [queryInput, setQueryInput] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -79,7 +88,7 @@ const FilmsTab: React.FC = () => {
 
   const hasKey = settings.tr4kerApiKey !== '';
 
-  const loadFilms = useCallback(async (p: FilmsPeriod, q: string, pageNum: number, append: boolean) => {
+  const loadItems = useCallback(async (cat: DiscoveryCategoryKey, p: FilmsPeriod, q: string, pageNum: number, append: boolean) => {
     const apiKey = settings.tr4kerApiKey;
     if (!apiKey) {
       setError('Colle ta clé API TR4KER dans Réglages pour voir les films.');
@@ -88,8 +97,10 @@ const FilmsTab: React.FC = () => {
     if (append) setLoadingMore(true);
     else setLoading(true);
     try {
-      const res = await fetchFilms(apiKey, { period: p, query: q, limit: PAGE_SIZE, page: pageNum, sort: 'seeders' });
-      setFilms((prev) => (append ? [...prev, ...res.films.filter((f) => !prev.some((x) => x.slug === f.slug))] : res.films));
+      const def = discoveryCategory(cat);
+      const res = await fetchFilms(apiKey, { cat: def.cat, period: p, query: q, limit: PAGE_SIZE, page: pageNum, sort: 'seeders' });
+      const items = filterByDiscoveryCategory(res.films, cat);
+      setFilms((prev) => (append ? [...prev, ...items.filter((f) => !prev.some((x) => x.slug === f.slug))] : items));
       setTotal(res.total);
       setPage(pageNum);
       setError('');
@@ -101,13 +112,14 @@ const FilmsTab: React.FC = () => {
     }
   }, []);
 
-  // Recharge à chaque changement de période / recherche validée.
+  // Recharge à chaque changement de catégorie / période / recherche validée.
   useEffect(() => {
-    void loadFilms(period, query, 1, false);
-  }, [period, query, loadFilms]);
+    void loadItems(categoryKey, period, query, 1, false);
+  }, [categoryKey, period, query, loadItems]);
 
-  // Notes Allociné en arrière-plan (même pattern que l'onglet Plex).
+  // Notes Allociné en arrière-plan (films + séries uniquement).
   useEffect(() => {
+    if (!category.allocine) return;
     const reqId = ++ratingsFillReq.current;
     const pending = films.filter((f) => !ratingsMapRef.current[f.slug]).slice(0, 60);
     if (pending.length === 0) return;
@@ -135,10 +147,10 @@ const FilmsTab: React.FC = () => {
     };
     const stagger = window.setTimeout(pump, 600);
     return () => window.clearTimeout(stagger);
-  }, [films]);
+  }, [films, category.allocine]);
 
   async function handleRefresh(event: CustomEvent<RefresherEventDetail>) {
-    await loadFilms(period, query, 1, false);
+    await loadItems(categoryKey, period, query, 1, false);
     event.detail.complete();
   }
 
@@ -176,7 +188,7 @@ const FilmsTab: React.FC = () => {
     }
   }
 
-  /** Envoie le .torrent vers Transmission (dossier films). */
+  /** Envoie le .torrent vers Transmission (dossier de la catégorie). */
   async function sendToDownload(film: DiscoveryFilm) {
     if (addingSlug) return;
     const apiKey = settings.tr4kerApiKey;
@@ -187,7 +199,8 @@ const FilmsTab: React.FC = () => {
     setAddingSlug(film.slug);
     try {
       const bytes = await downloadFilmTorrent(film.slug, apiKey);
-      const res = await uploadTorrentData(bytes, transmissionPath('films'));
+      const folder = discoveryCategory(categoryKey).folder;
+      const res = await uploadTorrentData(bytes, transmissionPath(folder));
       const name = res.added?.name ?? res.duplicate?.name ?? film.title;
       markSlugAdded(film.slug);
       setAddedSlugs(loadAddedSlugs());
@@ -227,7 +240,7 @@ const FilmsTab: React.FC = () => {
             <IonButton onClick={() => setShowSettings(true)}>
               <IonIcon icon={settingsOutline} />
             </IonButton>
-            <IonButton onClick={() => void loadFilms(period, query, 1, false)} disabled={loading || !hasKey}>
+            <IonButton onClick={() => void loadItems(categoryKey, period, query, 1, false)} disabled={loading || !hasKey}>
               <IonIcon icon={refreshOutline} />
             </IonButton>
           </IonButtons>
@@ -235,7 +248,7 @@ const FilmsTab: React.FC = () => {
         <IonToolbar>
           <IonSearchbar
             value={queryInput}
-            placeholder="Rechercher un film..."
+            placeholder={`Rechercher ${category.label.toLowerCase()}...`}
             debounce={700}
             onIonInput={(e) => {
               const v = String(e.detail.value ?? '');
@@ -252,8 +265,27 @@ const FilmsTab: React.FC = () => {
 
         <div style={{ padding: '8px 12px' }}>
           <IonSegment
+            value={categoryKey}
+            onIonChange={(e) => {
+              const v = String(e.detail.value) as DiscoveryCategoryKey;
+              setCategoryKey(v);
+              try {
+                localStorage.setItem('films_category_v1', v);
+              } catch {
+                /* ignore */
+              }
+            }}
+          >
+            {DISCOVERY_CATEGORIES.map((c) => (
+              <IonSegmentButton key={c.key} value={c.key}>
+                <IonLabel>{c.label}</IonLabel>
+              </IonSegmentButton>
+            ))}
+          </IonSegment>
+          <IonSegment
             value={period}
             onIonChange={(e) => setPeriod(String(e.detail.value) as FilmsPeriod)}
+            style={{ marginTop: 8 }}
           >
             {FILMS_PERIODS.map((p) => (
               <IonSegmentButton key={p.key} value={p.key}>
@@ -264,7 +296,7 @@ const FilmsTab: React.FC = () => {
           <p>
             <IonText color="medium">
               <small>
-                {query ? `Recherche "${query}"` : 'Nouveautés'} triés par popularité (seeders)
+                {query ? `Recherche "${query}"` : 'Nouveautés'} {category.label.toLowerCase()} triés par popularité (seeders)
                 {total > 0 ? ` • ${films.length}/${total}` : ''}
               </small>
             </IonText>
@@ -275,12 +307,12 @@ const FilmsTab: React.FC = () => {
           <div style={{ textAlign: 'center', padding: 24 }}>
             <IonSpinner />
             <p>
-              <IonText color="medium">Chargement des films...</IonText>
+              <IonText color="medium">Chargement des {category.label.toLowerCase()}...</IonText>
             </p>
           </div>
         ) : films.length === 0 ? (
           <div style={{ textAlign: 'center', padding: 24 }}>
-            <IonText color={error ? 'danger' : 'medium'}>{error || 'Aucun film trouvé'}</IonText>
+            <IonText color={error ? 'danger' : 'medium'}>{error || `Aucun résultat (${category.label.toLowerCase()})`}</IonText>
             {!hasKey && (
               <p>
                 <IonButton size="small" onClick={() => setShowSettings(true)}>
@@ -307,7 +339,7 @@ const FilmsTab: React.FC = () => {
                     {formatBytes(film.sizeBytes)} • {film.seeders} seeders
                     {film.addedAt ? ` • ${film.addedAt.toLocaleDateString()}` : ''}
                   </p>
-                  <FilmRating film={film} />
+                  {category.allocine && <FilmRating film={film} />}
                   <p>
                     {film.isFreeleech && <IonBadge color="tertiary">Freeleech</IonBadge>}{' '}
                     {addedSlugs.has(film.slug) && <IonBadge color="success">Ajouté</IonBadge>}
@@ -320,17 +352,17 @@ const FilmsTab: React.FC = () => {
 
         {films.length > 0 && films.length < total && (
           <div style={{ textAlign: 'center', padding: 12 }}>
-            <IonButton fill="outline" size="small" disabled={loadingMore} onClick={() => void loadFilms(period, query, page + 1, true)}>
+            <IonButton fill="outline" size="small" disabled={loadingMore} onClick={() => void loadItems(categoryKey, period, query, page + 1, true)}>
               {loadingMore ? <IonSpinner style={{ width: 16, height: 16 }} /> : 'Charger plus'}
             </IonButton>
           </div>
         )}
 
-        {/* Fiche film */}
+        {/* Fiche */}
         <IonModal isOpen={detail !== null} onDidDismiss={() => setDetail(null)} className="detail-modal">
           <IonHeader>
             <IonToolbar>
-              <IonTitle>Fiche film</IonTitle>
+              <IonTitle>Fiche</IonTitle>
               <IonButtons slot="end">
                 <IonButton onClick={() => setDetail(null)}>Fermer</IonButton>
               </IonButtons>
@@ -361,49 +393,54 @@ const FilmsTab: React.FC = () => {
                     </div>
                   </div>
                 </div>
-                <h3>Synopsis</h3>
-                <IonText color="medium">
-                  <p className="detail-summary">
-                    {ratingsMap[detail.slug]?.synopsis ??
-                      (ratingsMap[detail.slug] ? 'Aucun synopsis Allociné.' : 'Recherche du synopsis…')}
-                  </p>
-                </IonText>
-                {(() => {
-                  const r = ratingsMap[detail.slug];
-                  if (!r) {
-                    return (
-                      <p className="ratings-row">
-                        <IonIcon icon={starOutline} />
-                        <IonText color="medium">Recherche de la note Allociné…</IonText>
+                {category.allocine && (
+                  <>
+                    <h3>Synopsis</h3>
+                    <IonText color="medium">
+                      <p className="detail-summary">
+                        {ratingsMap[detail.slug]?.synopsis ??
+                          (ratingsMap[detail.slug] ? 'Aucun synopsis Allociné.' : 'Recherche du synopsis…')}
                       </p>
+                    </IonText>
+                  </>
+                )}
+                {category.allocine &&
+                  (() => {
+                    const r = ratingsMap[detail.slug];
+                    if (!r) {
+                      return (
+                        <p className="ratings-row">
+                          <IonIcon icon={starOutline} />
+                          <IonText color="medium">Recherche de la note Allociné…</IonText>
+                        </p>
+                      );
+                    }
+                    return (
+                      <div className="ratings-block">
+                        <IonBadge color="tertiary">Allociné</IonBadge>
+                        {r.press != null && (
+                          <div className="ratings-line">
+                            <RatingStars value={r.press} />
+                            <strong>{formatAllocineNote(r.press)}</strong>
+                            <IonText color="medium">
+                              <small>Presse{r.pressReviews ? ` • ${r.pressReviews} critiques` : ''}</small>
+                            </IonText>
+                          </div>
+                        )}
+                        {r.spectators != null && (
+                          <div className="ratings-line">
+                            <RatingStars value={r.spectators} />
+                            <strong>{formatAllocineNote(r.spectators)}</strong>
+                            <IonText color="medium">
+                              <small>
+                                Spectateurs{r.votes ? ` • ${r.votes.toLocaleString('fr-FR')} votes` : ''}
+                              </small>
+                            </IonText>
+                          </div>
+                        )}
+                      </div>
                     );
-                  }
-                  return (
-                    <div className="ratings-block">
-                      <IonBadge color="tertiary">Allociné</IonBadge>
-                      {r.press != null && (
-                        <div className="ratings-line">
-                          <RatingStars value={r.press} />
-                          <strong>{formatAllocineNote(r.press)}</strong>
-                          <IonText color="medium">
-                            <small>Presse{r.pressReviews ? ` • ${r.pressReviews} critiques` : ''}</small>
-                          </IonText>
-                        </div>
-                      )}
-                      {r.spectators != null && (
-                        <div className="ratings-line">
-                          <RatingStars value={r.spectators} />
-                          <strong>{formatAllocineNote(r.spectators)}</strong>
-                          <IonText color="medium">
-                            <small>
-                              Spectateurs{r.votes ? ` • ${r.votes.toLocaleString('fr-FR')} votes` : ''}
-                            </small>
-                          </IonText>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
+                  })()}
                 <h3>Descriptif TR4KER</h3>
                 <IonText color="medium">
                   <p className="detail-summary">
@@ -432,14 +469,18 @@ const FilmsTab: React.FC = () => {
                       ? 'Renvoyer vers Transmission'
                       : 'Télécharger'}
                 </IonButton>
-                <IonButton expand="block" fill="outline" disabled={!detail} onClick={() => detail && openAllocine(detail)}>
-                  <IonIcon icon={filmOutline} slot="start" />
-                  Voir sur Allociné
-                </IonButton>
-                <IonButton expand="block" fill="outline" disabled={!detail} onClick={() => detail && void openFormats(detail)}>
-                  <IonIcon icon={downloadOutline} slot="start" />
-                  Autres formats
-                </IonButton>
+                {category.allocine && (
+                  <IonButton expand="block" fill="outline" disabled={!detail} onClick={() => detail && openAllocine(detail)}>
+                    <IonIcon icon={filmOutline} slot="start" />
+                    Voir sur Allociné
+                  </IonButton>
+                )}
+                {categoryKey === 'films' && (
+                  <IonButton expand="block" fill="outline" disabled={!detail} onClick={() => detail && void openFormats(detail)}>
+                    <IonIcon icon={downloadOutline} slot="start" />
+                    Autres formats
+                  </IonButton>
+                )}
               </div>
             </IonToolbar>
           </IonFooter>
@@ -506,7 +547,7 @@ const FilmsTab: React.FC = () => {
           onClose={() => {
             setShowSettings(false);
             // Cas clé API tout juste collée : recharge si la liste est vide.
-            if (films.length === 0) void loadFilms(period, query, 1, false);
+            if (films.length === 0) void loadItems(categoryKey, period, query, 1, false);
           }}
         />
         <IonToast isOpen={toast !== ''} message={toast} duration={3500} onDidDismiss={() => setToast('')} />

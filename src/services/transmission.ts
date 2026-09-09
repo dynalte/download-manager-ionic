@@ -4,6 +4,8 @@
  */
 import { settings } from './settings';
 import { AppConfig } from '../config/appConfig';
+import { appLog } from './debugLog';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 
 export class TorrentUploadError extends Error {}
 
@@ -106,7 +108,7 @@ async function electronRpc<T>(payload: Record<string, unknown>): Promise<T> {
   }
 }
 
-function baseRequest(sessionID?: string): HeadersInit {
+function baseRequest(sessionID?: string): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (sessionID) headers['X-Transmission-Session-Id'] = sessionID;
   const username = settings.transmissionUsername;
@@ -118,31 +120,98 @@ function baseRequest(sessionID?: string): HeadersInit {
 }
 
 async function fetchSessionID(): Promise<string> {
-  const res = await fetch(rpcURL(), { method: 'POST', headers: baseRequest() });
+  let res: RpcResponse;
+  try {
+    res = await rpcPost(baseRequest(), undefined);
+  } catch (e) {
+    appLog('error', 'transmission', `session-id : réseau injoignable (${e instanceof Error ? `${e.name}: ${e.message}` : String(e)})`);
+    throw e instanceof Error ? e : new Error(String(e));
+  }
   const sessionID = res.headers.get('X-Transmission-Session-Id');
   if (!sessionID) {
     // Transmission renvoie 409 + header ; certains proxys le mettent dans le body.
     // On relit quand même le header (insensible à la casse déjà géré par fetch).
+    appLog('error', 'transmission', `session-id : HTTP ${res.status} sans header de session`);
     throw new TorrentUploadError("Le serveur Transmission n'a pas retourne de session ID.");
   }
   return sessionID;
 }
 
+/** Réponse RPC minimale (fetch WebView ou CapacitorHttp natif). */
+export interface RpcResponse {
+  status: number;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+  json(): Promise<any>;
+}
+
+/**
+ * POST RPC : requêtes natives via CapacitorHttp sur iOS/Android (pas de
+ * CORS/preflight WebView — Transmission 4.1 ne répond plus les headers
+ * CORS au OPTIONS, contrairement à la 4.0), fetch sinon.
+ */
+async function rpcPost(headers: Record<string, string>, body?: string): Promise<RpcResponse> {
+  if (Capacitor.isNativePlatform()) {
+    let res;
+    try {
+      res = await CapacitorHttp.post({
+        url: rpcURL(),
+        headers,
+        data: body ?? '',
+        connectTimeout: 15000,
+        readTimeout: 90000,
+        responseType: 'text',
+      });
+    } catch (e) {
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+    const rawHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(res.headers ?? {})) rawHeaders[k.toLowerCase()] = String(v);
+    const textBody = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? '');
+    return {
+      status: res.status,
+      headers: { get: (name: string) => rawHeaders[name.toLowerCase()] ?? null },
+      text: async () => textBody,
+      json: async () => JSON.parse(textBody || '{}') as unknown,
+    };
+  }
+  const res = await fetch(rpcURL(), { method: 'POST', headers, body });
+  return {
+    status: res.status,
+    headers: { get: (name: string) => res.headers.get(name) },
+    text: () => res.text(),
+    json: () => res.json(),
+  };
+}
+
 /** Récupère un session-id valide (avec retry sur 409). */
-async function withSession<T>(fn: (sessionID: string) => Promise<Response>): Promise<T> {
+async function withSession<T>(fn: (sessionID: string) => Promise<RpcResponse>): Promise<T> {
   let sessionID = await fetchSessionID().catch(() => '');
-  let res = await fn(sessionID);
+  let res: RpcResponse;
+  try {
+    res = await fn(sessionID);
+  } catch (e) {
+    appLog('error', 'transmission', `rpc : réseau injoignable (${e instanceof Error ? `${e.name}: ${e.message}` : String(e)})`);
+    throw e instanceof Error ? e : new Error(String(e));
+  }
   if (res.status === 409) {
     const retry = res.headers.get('X-Transmission-Session-Id');
     if (!retry) throw new TorrentUploadError("Le serveur Transmission n'a pas retourne de session ID.");
-    res = await fn(retry);
+    try {
+      res = await fn(retry);
+    } catch (e) {
+      appLog('error', 'transmission', `rpc (retry 409) : réseau injoignable (${e instanceof Error ? `${e.name}: ${e.message}` : String(e)})`);
+      throw e instanceof Error ? e : new Error(String(e));
+    }
   }
   if (res.status !== 200) {
     const body = await res.text().catch(() => '');
+    appLog('error', 'transmission', `rpc : HTTP ${res.status} (${body.slice(0, 200)})`);
     throw new TorrentUploadError(`Le serveur a retourne ${res.status}. ${body}`);
   }
   const json = (await res.json()) as { result: string; arguments?: unknown };
   if (json.result !== 'success') {
+    appLog('error', 'transmission', `rpc : résultat "${json.result}"`);
     throw new TorrentUploadError(`Transmission a retourne une erreur: ${json.result}`);
   }
   return json.arguments as T;
@@ -166,11 +235,7 @@ export async function uploadTorrentData(data: Uint8Array | ArrayBuffer, download
   }
   return toAddResult(
     await withSession<TorrentAddArguments>(async (sessionID) =>
-      fetch(rpcURL(), {
-        method: 'POST',
-        headers: baseRequest(sessionID),
-        body: JSON.stringify(payload),
-      }),
+      rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
     ),
   );
 }
@@ -186,11 +251,7 @@ export async function uploadMagnet(url: string, downloadDir?: string): Promise<T
   }
   return toAddResult(
     await withSession<TorrentAddArguments>(async (sessionID) =>
-      fetch(rpcURL(), {
-        method: 'POST',
-        headers: baseRequest(sessionID),
-        body: JSON.stringify(payload),
-      }),
+      rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
     ),
   );
 }
@@ -234,11 +295,7 @@ export async function fetchDownloads(): Promise<TransmissionDownloadItem[]> {
   const args = isElectron()
     ? await electronRpc<TorrentGetArguments>(payload)
     : await withSession<TorrentGetArguments>(async (sessionID) =>
-        fetch(rpcURL(), {
-          method: 'POST',
-          headers: baseRequest(sessionID),
-          body: JSON.stringify(payload),
-        }),
+        rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
       );
   return (args.torrents ?? []).map((t) => ({
     id: t.id,
@@ -267,11 +324,7 @@ export async function removeTorrent(id: number, deleteLocalData = true): Promise
     return;
   }
   await withSession<unknown>(async (sessionID) =>
-    fetch(rpcURL(), {
-      method: 'POST',
-      headers: baseRequest(sessionID),
-      body: JSON.stringify(payload),
-    }),
+    rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
   );
 }
 

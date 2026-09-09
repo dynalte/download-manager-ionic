@@ -30,6 +30,7 @@ import {
 import { requestAuthorizationIfNeeded } from '../services/completionMonitor';
 import { loadSeenSuggestions } from '../services/seenSuggestions';
 import { clearSeenEverywhere } from '../services/seenSync';
+import { testServerConnection } from '../services/serverApi';
 import { getThemeMode, setThemeMode, type ThemeMode } from '../services/theme';
 
 function useStored(key: string, fallback: string) {
@@ -65,6 +66,8 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'http://photos2.dynaspirit.com:8080/api-download-manager.php');
   const [seenSyncToken, setSeenSyncToken] = useStored(Keys.seenSyncToken, '');
   const [seenCount, setSeenCount] = useState(0);
+  const [syncTestMsg, setSyncTestMsg] = useState('');
+  const [syncTesting, setSyncTesting] = useState(false);
   useEffect(() => {
     if (isOpen) setSeenCount(loadSeenSuggestions().length);
   }, [isOpen]);
@@ -198,6 +201,27 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           </IonItem>
           <IonItem>
             <IonInput label="Token synchro (même que API_TOKEN côté PHP)" labelPlacement="stacked" type="password" value={seenSyncToken} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncToken(String(e.detail.value ?? ''))} placeholder="..." />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>{syncTestMsg || 'Teste la connexion au serveur de synchro.'}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              disabled={syncTesting}
+              onClick={() => {
+                setSyncTesting(true);
+                setSyncTestMsg('');
+                void testServerConnection()
+                  .then((msg) => setSyncTestMsg(msg))
+                  .catch((e) => setSyncTestMsg(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setSyncTesting(false));
+              }}
+            >
+              {syncTesting ? 'Test…' : 'Tester'}
+            </IonButton>
           </IonItem>
 
           <IonItem>

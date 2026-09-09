@@ -25,6 +25,11 @@
       GET  ?action=subs_list                     → {ok:true, subs:[{id,title,query,year,enabled,lastSeason,lastEpisode,addedKeys,createdAt,lastCheckAt,lastResult}]}
       POST ?action=subs_upsert {sub:{...}}       → {ok:true} (last-writer-wins, fusion côté app)
       POST ?action=subs_remove {id}              → {ok:true}
+      Fichiers (rattrapage si Transmission oublie des données) :
+      POST ?action=files_wipe {location, name}   → {ok:true, deleted:bool}
+        location = downloadDir de session (ex /downloads/films),
+        name = racine du torrent (fichier ou dossier, sans slash).
+        Cage stricte : seuls les dossiers montés sont autorisés.
 */
 declare(strict_types=1);
 
@@ -120,6 +125,12 @@ try {
             last_result TEXT NOT NULL DEFAULT \'\'
         )'
     );
+    // Migration douce : colonne ajoutée après coup (ignore si déjà là).
+    try {
+        $db->exec('ALTER TABLE series_subs ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0');
+    } catch (Throwable $e) {
+        /* colonne déjà présente */
+    }
 } catch (Throwable $e) {
     fail('SQLite indisponible (php-sqlite3 ? dossier writable ?) : ' . $e->getMessage(), 500);
 }
@@ -189,6 +200,7 @@ function row_to_sub(array $row): array
         'createdAt' => (int) $row['created_at'],
         'lastCheckAt' => (int) $row['last_check_at'],
         'lastResult' => (string) $row['last_result'],
+        'updatedAt' => isset($row['updated_at']) ? (int) $row['updated_at'] : 0,
     ];
 }
 
@@ -219,8 +231,8 @@ if ($action === 'subs_upsert') {
     $keys = array_values(array_slice(array_filter(array_map('strval', $keys)), 0, 500));
     $stmt = $db->prepare(
         'INSERT OR REPLACE INTO series_subs
-         (id, title, query, year, enabled, last_season, last_episode, added_keys, created_at, last_check_at, last_result)
-         VALUES (:id, :title, :query, :year, :enabled, :ls, :le, :keys, :ca, :lca, :lr)'
+         (id, title, query, year, enabled, last_season, last_episode, added_keys, created_at, last_check_at, last_result, updated_at)
+         VALUES (:id, :title, :query, :year, :enabled, :ls, :le, :keys, :ca, :lca, :lr, :ua)'
     );
     $stmt->execute([
         ':id' => $id,
@@ -234,6 +246,7 @@ if ($action === 'subs_upsert') {
         ':ca' => (int) ($sub['createdAt'] ?? time()),
         ':lca' => (int) ($sub['lastCheckAt'] ?? 0),
         ':lr' => trim((string) ($sub['lastResult'] ?? '')),
+        ':ua' => (int) ($sub['updatedAt'] ?? time()),
     ]);
     out(['ok' => true]);
 }
@@ -249,4 +262,74 @@ if ($action === 'subs_remove') {
     out(['ok' => true]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove).', 400);
+// ---------- Fichiers (rattrapage effacement Transmission) ----------
+
+// Chemins session Transmission → chemins conteneur (montages docker).
+// Toute location hors de cette liste est refusée (403).
+const WIPE_MAP = [
+    '/downloads/films' => '/var/www/html/dl-films',
+    '/downloads/series' => '/var/www/html/dl-series',
+    '/downloads/complete' => '/var/www/html/dl-complete',
+    '/downloads/incomplete' => '/var/www/html/dl-incomplete',
+    '/downloads/musique' => '/var/www/html/dl-musique',
+    '/downloads/oculus' => '/var/www/html/oculus',
+    '/downloads/livres' => '/var/www/html/livres',
+];
+
+/** Suppression récursive sans suivre les liens symboliques. */
+function rm_rf(string $path): void
+{
+    if (is_link($path) || is_file($path)) {
+        @unlink($path);
+        return;
+    }
+    if (!is_dir($path)) {
+        return;
+    }
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $f) {
+        if ($f->isLink() || $f->isFile()) {
+            @unlink($f->getPathname());
+        } elseif ($f->isDir()) {
+            @rmdir($f->getPathname());
+        }
+    }
+    @rmdir($path);
+}
+
+if ($action === 'files_wipe') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    $location = trim((string) ((is_array($input) ? $input['location'] : null) ?? ''));
+    $name = trim((string) ((is_array($input) ? $input['name'] : null) ?? ''));
+    // name = racine du torrent uniquement : aucun slash, aucun traversal.
+    if ($name === '' || str_contains($name, '/') || str_contains($name, "\0") || $name === '.' || $name === '..') {
+        fail('Nom invalide.', 400);
+    }
+    $base = null;
+    foreach (WIPE_MAP as $prefix => $dir) {
+        if ($location === $prefix || str_starts_with($location, $prefix . '/')) {
+            $base = $dir . substr($location, strlen($prefix));
+            break;
+        }
+    }
+    if ($base === null) {
+        fail('Emplacement non autorisé.', 403);
+    }
+    $target = $base . '/' . $name;
+    // Cage : le parent réel doit exister et rester sous la racine autorisée.
+    $realParent = realpath(dirname($target));
+    $realBase = realpath($base);
+    if ($realParent === false || $realBase === false || ($realParent !== $realBase && !str_starts_with($realParent, $realBase . '/'))) {
+        fail('Emplacement non autorisé.', 403);
+    }
+    if (!file_exists($target) && !is_link($target)) {
+        out(['ok' => true, 'deleted' => false]); // déjà parti (daemon OK)
+    }
+    rm_rf($target);
+    out(['ok' => true, 'deleted' => !file_exists($target) && !is_link($target)]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe).', 400);

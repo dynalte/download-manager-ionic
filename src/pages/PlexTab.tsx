@@ -51,6 +51,7 @@ import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '
 import { loadSeenSuggestions, seenKeyFor, seenKeys, type SeenSuggestion } from '../services/seenSuggestions';
 import { loadSeenMerged, markSeenEverywhere } from '../services/seenSync';
 import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
+import { forgetDeletedSubscription } from '../services/seriesWatch';
 import { pushSubscription } from '../services/seriesSync';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { isDesktopElectron } from '../services/embeddedBrowser';
@@ -565,7 +566,9 @@ const PlexTab: React.FC = () => {
         createdAt: Date.now(),
         lastCheckAt: 0,
         lastResult: `Base Plex : ${base}`,
+        updatedAt: Date.now(),
       };
+      forgetDeletedSubscription(sub.id);
       upsertSubscription(sub);
       void pushSubscription(sub);
       setPlaybackMsg(`Suivi activé : ${item.title} (base ${base}). Voir l’onglet Suivis.`);

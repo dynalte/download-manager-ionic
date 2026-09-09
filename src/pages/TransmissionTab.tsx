@@ -31,6 +31,8 @@ import { fetchLinkRecords, normalizedTitleForMatching, type PlexLinkRecord } fro
 import { refreshLibraries } from '../services/plex';
 import { settings, folderDisplayName, folderForDownloadDir, type DestinationFolder } from '../services/settings';
 import { ingestDownloads, requestAuthorizationIfNeeded } from '../services/completionMonitor';
+import { appLog } from '../services/debugLog';
+import { wipeRemoteFiles } from '../services/serverApi';
 import SettingsModal from '../components/SettingsModal';
 
 type Filter = 'active' | 'finished' | 'all' | 'plexWatched' | 'plexUnwatched';
@@ -357,6 +359,13 @@ const TransmissionTab: React.FC = () => {
                     {formatSize(d.totalSize)} • {Math.round(d.percentDone * 100)}% • {d.statusLabel} • {formatRate(d.rateDownload)}/s • Ratio{' '}
                     {d.uploadRatio < 0 ? '?' : d.uploadRatio.toFixed(2)} • ETA {formatETA(d.eta)}
                   </p>
+                  {!!d.downloadDir && (
+                    <p style={{ whiteSpace: 'normal', wordBreak: 'break-all' }}>
+                      <IonText color="medium">
+                        <small>📁 {d.downloadDir}</small>
+                      </IonText>
+                    </p>
+                  )}
                   {!!d.errorString && (
                     <IonText color="danger">
                       <p>{d.errorString}</p>
@@ -396,26 +405,33 @@ const TransmissionTab: React.FC = () => {
         <IonAlert
           isOpen={pendingDeletion !== null}
           header="Supprimer ce telechargement ?"
-          message={pendingDeletion?.name ?? ''}
+          message={`${pendingDeletion?.name ?? ''}${pendingDeletion?.downloadDir ? `\n\nDossier effacé : ${pendingDeletion.downloadDir}` : ''}\n\n(Seuls les fichiers suivis par Transmission à cet emplacement sont effacés.)`}
           buttons={[
             { text: 'Annuler', role: 'cancel', handler: () => setPendingDeletion(null) },
             {
               text: 'Supprimer fichiers + torrent',
               role: 'destructive',
-              handler: () => {
-                const target = pendingDeletion;
-                setPendingDeletion(null);
-                if (target) {
-                  void (async () => {
-                    try {
-                      await removeTorrent(target.id, true);
-                      await refreshDownloads();
-                    } catch (e) {
-                      setError(`Erreur suppression: ${e instanceof Error ? e.message : String(e)}`);
-                    }
-                  })();
-                }
-              },
+                handler: () => {
+                  const target = pendingDeletion;
+                  setPendingDeletion(null);
+                  if (target) {
+                    void (async () => {
+                      try {
+                        appLog('info', 'transmission', `suppression id=${target.id} « ${target.name.slice(0, 80)} » (fichiers inclus)…`);
+                        await removeTorrent(target.id, true);
+                        await refreshDownloads();
+                        appLog('info', 'transmission', `suppression id=${target.id} confirmée par le daemon`);
+                        // Rattrapage : le daemon oublie parfois les données en silence (#5361).
+                        const wiped = await wipeRemoteFiles(target.downloadDir, target.name);
+                        if (wiped) appLog('info', 'transmission', `résidu effacé côté serveur pour « ${target.name.slice(0, 60)} »`);
+                      } catch (e) {
+                        const msg = e instanceof Error ? e.message : String(e);
+                        appLog('error', 'transmission', `suppression id=${target.id} échouée : ${msg}`);
+                        setError(`Erreur suppression: ${msg}`);
+                      }
+                    })();
+                  }
+                },
             },
           ]}
         />

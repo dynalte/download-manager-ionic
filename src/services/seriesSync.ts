@@ -5,6 +5,7 @@
  * récent gagne) — le serveur est un dumb store (last-writer-wins par upsert).
  */
 import {
+  loadDeletedSubscriptionIds,
   loadSubscriptions,
   replaceSubscriptions,
   type SeriesSubscription,
@@ -25,18 +26,27 @@ function sanitize(sub: SeriesSubscription): SeriesSubscription | null {
     createdAt: Number.isFinite(sub.createdAt) ? sub.createdAt : Date.now(),
     lastCheckAt: Number.isFinite(sub.lastCheckAt) ? sub.lastCheckAt : 0,
     lastResult: typeof sub.lastResult === 'string' ? sub.lastResult : '',
+    updatedAt: Number.isFinite(sub.updatedAt) ? sub.updatedAt : 0,
   };
 }
 
-/** Fusion d'un distant dans le local : union anti-doublons, progression et état les plus récents. */
+/**
+ * Fusion last-writer-wins : l'état le plus récemment écrit gagne (progression
+ * comprise — une base volontairement redescendue n'est plus écrasée par l'ancien max).
+ * Seuls les anti-doublons fusionnent toujours (union).
+ */
 function mergeSub(local: SeriesSubscription, remote: SeriesSubscription): SeriesSubscription {
   const keys = [...new Set([...local.addedKeys, ...remote.addedKeys])].slice(-500);
-  const winner = (remote.lastCheckAt ?? 0) >= (local.lastCheckAt ?? 0) ? remote : local;
-  const seasonNewer =
-    remote.lastSeason > local.lastSeason ||
-    (remote.lastSeason === local.lastSeason && remote.lastEpisode > local.lastEpisode);
-  const base = seasonNewer ? remote : winner;
-  return { ...base, addedKeys: keys };
+  const rTime = remote.updatedAt ?? 0;
+  const lTime = local.updatedAt ?? 0;
+  let winner: SeriesSubscription;
+  if (rTime !== lTime) winner = rTime > lTime ? remote : local;
+  else {
+    const rCheck = remote.lastCheckAt ?? 0;
+    const lCheck = local.lastCheckAt ?? 0;
+    winner = rCheck !== lCheck ? (rCheck > lCheck ? remote : local) : local;
+  }
+  return { ...winner, addedKeys: keys };
 }
 
 /** Charge l'union local + serveur (repli : local seul). Repousse la fusion au serveur. */
@@ -46,10 +56,21 @@ export async function loadSubscriptionsMerged(): Promise<SeriesSubscription[]> {
   try {
     const data = (await serverApi('subs_list')) as { subs?: SeriesSubscription[] };
     const remote = Array.isArray(data.subs) ? data.subs : [];
+    const tombstones = new Set(loadDeletedSubscriptionIds());
     const byId = new Map(local.map((s) => [s.id, s]));
     for (const raw of remote) {
       const r = sanitize(raw);
-      if (!r) continue;
+      // Supprimé ici : ne pas ressusciter, et purger la ligne serveur.
+      if (!r || tombstones.has(r.id)) {
+        if (r) {
+          try {
+            await serverApi('subs_remove', { id: r.id });
+          } catch {
+            /* prochaine fois */
+          }
+        }
+        continue;
+      }
       const l = byId.get(r.id);
       byId.set(r.id, l ? mergeSub(l, r) : r);
     }

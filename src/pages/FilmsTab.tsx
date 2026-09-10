@@ -235,7 +235,7 @@ const FilmsTab: React.FC = () => {
     <IonPage>
       <IonHeader>
         <IonToolbar>
-          <IonTitle>Films</IonTitle>
+          <IonTitle>Catalogue</IonTitle>
           <IonButtons slot="end">
             <IonButton onClick={() => setShowSettings(true)}>
               <IonIcon icon={settingsOutline} />

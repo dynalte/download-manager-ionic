@@ -2,7 +2,7 @@ import React, { useEffect } from 'react';
 import { IonApp, IonRouterOutlet, IonTabs, IonTabBar, IonTabButton, IonIcon, IonLabel } from '@ionic/react';
 import { IonReactRouter } from '@ionic/react-router';
 import { Redirect, Route } from 'react-router-dom';
-import { globeOutline, arrowDownCircleOutline, layersOutline, compassOutline, notificationsOutline, filmOutline } from 'ionicons/icons';
+import { globeOutline, arrowDownCircleOutline, layersOutline, compassOutline, notificationsOutline, libraryOutline } from 'ionicons/icons';
 
 import SiteTab from './pages/SiteTab';
 import TransmissionTab from './pages/TransmissionTab';
@@ -57,8 +57,8 @@ const App: React.FC = () => {
               <IonLabel>Plex</IonLabel>
             </IonTabButton>
             <IonTabButton tab="films" href="/films">
-              <IonIcon icon={filmOutline} />
-              <IonLabel>Films</IonLabel>
+              <IonIcon icon={libraryOutline} />
+              <IonLabel>Catalogue</IonLabel>
             </IonTabButton>
             <IonTabButton tab="browser" href="/browser">
               <IonIcon icon={compassOutline} />

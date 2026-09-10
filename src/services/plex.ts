@@ -617,6 +617,21 @@ export async function refreshLibraries(
   return keys.length;
 }
 
+/**
+ * Scan ciblé par type de média (films → sections movie, séries → show).
+ * Utilisé en auto après un téléchargement terminé (0 si aucune section du type).
+ */
+export async function refreshLibrariesForType(
+  baseURLString: string,
+  token: string,
+  sectionType: 'movie' | 'show',
+): Promise<number> {
+  const sections = await fetchSections(baseURLString, token);
+  const keys = sections.filter((s) => s.type === sectionType).map((s) => s.key);
+  if (keys.length === 0) return 0;
+  return refreshLibraries(baseURLString, token, keys);
+}
+
 export async function fetchLinkRecords(
   baseURLString: string,
   token: string,

@@ -245,22 +245,28 @@ const PlexTab: React.FC = () => {
     setDlError({});
     setDlMsg('');
     try {
-      // Base la suggestion sur la collection COMPLÈTE (pas les 20 derniers affichés) :
-      // recharge jusqu'à 1000 items/section, repli sur la liste déjà chargée si échec.
-      let source = libraries;
-      try {
-        const full = await fetchLibrariesData(
+      // Collection COMPLÈTE + historique + « déjà vu » en parallèle
+      // (un seul temps d'attente réseau au lieu de trois en chaîne).
+      const [full, seenLoaded, historyLoaded] = await Promise.all([
+        fetchLibrariesData(
           settings.plexResolvedBaseURL,
           settings.plexToken,
           settings.plexSectionKeys,
           1000,
-        );
-        if (full.length > 0) {
-          source = full;
-          setLibraries(full);
-        }
-      } catch {
-        /* repli : liste affichée */
+        ).catch(() => null),
+        loadSeenMerged().catch(() => null),
+        fetchWatchHistory(
+          settings.plexResolvedBaseURL,
+          settings.plexToken,
+          300,
+        ).catch(() => []),
+      ]);
+      // Base la suggestion sur la collection COMPLÈTE (pas les 20 derniers affichés),
+      // repli sur la liste déjà chargée si échec.
+      let source = libraries;
+      if (full && full.length > 0) {
+        source = full;
+        setLibraries(full);
       }
       const entries = source.flatMap((lib) =>
         lib.items.map((i) => ({ title: i.title, year: i.year, type: i.type })),
@@ -269,23 +275,9 @@ const PlexTab: React.FC = () => {
       // Historique de visionnage (vus même supprimés) + titres marqués « déjà vu » :
       // best effort, exclus des suggestions (prompt IA + filtre local).
       // Les « déjà vu » fusionnent local + serveur SQLite si synchro configurée.
-      let history: { title: string; year?: string; type: string }[] = [];
-      let seen: SeenSuggestion[] = seenList;
-      try {
-        seen = await loadSeenMerged();
-        setSeenList(seen);
-      } catch {
-        /* repli : état en mémoire */
-      }
-      try {
-        history = await fetchWatchHistory(
-          settings.plexResolvedBaseURL,
-          settings.plexToken,
-          300,
-        );
-      } catch {
-        history = [];
-      }
+      const seen = seenLoaded ?? seenList;
+      if (seenLoaded) setSeenList(seenLoaded);
+      const history = historyLoaded ?? [];
       setSuggestHistoryCount(history.length);
       const seenEntries = seen.map((s) => ({ title: s.t, year: s.y, type: 'unknown' }));
       const intent = semanticQuery.trim();
@@ -308,11 +300,17 @@ const PlexTab: React.FC = () => {
           const msg = e instanceof Error ? e.message : String(e);
           const fallbackable = /429|402|injoignable|délai dépassé|ne répond pas|HTTP 5\d\d/i.test(msg);
           if (!settings.geminiApiKey || !fallbackable) throw e;
-          recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
-            ...opts,
-            model: settings.geminiModel,
-          });
-          setDlMsg('OpenRouter saturé : génération via Gemini.');
+          try {
+            recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+              ...opts,
+              model: settings.geminiModel,
+            });
+            setDlMsg('OpenRouter saturé : génération via Gemini.');
+          } catch (e2) {
+            // Les deux providers ont échoué : affiche les deux causes, pas seulement la dernière.
+            const msg2 = e2 instanceof Error ? e2.message : String(e2);
+            throw new Error(`OpenRouter : ${msg}\nRepli Gemini : ${msg2}`);
+          }
         }
       } else {
         recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {

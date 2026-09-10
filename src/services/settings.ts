@@ -172,9 +172,15 @@ export const settings = {
   },
   get geminiModel(): string {
     const stored = getString(Keys.geminiModel, '').trim();
-    // Migration : gemini-2.0-flash (et 1.5) retirés par Google → défaut actuel.
-    if (stored === '' || stored === 'gemini-2.0-flash' || stored.startsWith('gemini-1.5') || stored === 'gemini-pro') {
-      return 'gemini-2.5-flash';
+    // Migration : 2.x retirés par Google (404 pour les clés récentes) → défaut actuel.
+    if (
+      stored === '' ||
+      stored === 'gemini-3-flash' ||
+      stored.startsWith('gemini-2.') ||
+      stored.startsWith('gemini-1.5') ||
+      stored === 'gemini-pro'
+    ) {
+      return 'gemini-3.5-flash-lite';
     }
     return stored;
   },

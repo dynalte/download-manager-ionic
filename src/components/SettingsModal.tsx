@@ -60,7 +60,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [fileServerPass, setFileServerPass] = useStored(Keys.fileServerPassword, AppConfig.fileServerPassword);
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
-  const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-2.5-flash');
+  const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-3.5-flash-lite');
   const [openrouterApiKey, setOpenrouterApiKey] = useStored(Keys.openrouterApiKey, '');
   const [openrouterModel, setOpenrouterModel] = useStored(Keys.openrouterModel, 'google/gemma-4-26b-a4b-it:free');
   const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'http://photos2.dynaspirit.com:8080/api-download-manager.php');
@@ -71,10 +71,14 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   useEffect(() => {
     if (isOpen) setSeenCount(loadSeenSuggestions().length);
   }, [isOpen]);
-  // Valeur stockée migrée à l'affichage (2.0/1.5 retirés par Google).
+  // Valeur stockée migrée à l'affichage (2.x retirés par Google).
   const geminiModel =
-    !geminiModelRaw || geminiModelRaw === 'gemini-2.0-flash' || geminiModelRaw.startsWith('gemini-1.5') || geminiModelRaw === 'gemini-pro'
-      ? 'gemini-2.5-flash'
+    !geminiModelRaw ||
+    geminiModelRaw === 'gemini-3-flash' ||
+    geminiModelRaw.startsWith('gemini-2.') ||
+    geminiModelRaw.startsWith('gemini-1.5') ||
+    geminiModelRaw === 'gemini-pro'
+      ? 'gemini-3.5-flash-lite'
       : geminiModelRaw;
   const [plexBaseURL, setPlexBaseURL] = useStored(Keys.plexBaseURL, AppConfig.plexBaseURL);
   const [plexToken, setPlexToken] = useStored(Keys.plexToken, AppConfig.plexToken);
@@ -171,7 +175,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             <IonInput label="Clé API Gemini" labelPlacement="stacked" type="password" value={geminiApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiApiKey(String(e.detail.value ?? ''))} placeholder="AIza..." />
           </IonItem>
           <IonItem>
-            <IonInput label="Modèle Gemini" labelPlacement="stacked" value={geminiModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiModel(String(e.detail.value ?? ''))} placeholder="gemini-2.5-flash" />
+            <IonInput label="Modèle Gemini" labelPlacement="stacked" value={geminiModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiModel(String(e.detail.value ?? ''))} placeholder="gemini-3.5-flash-lite" />
           </IonItem>
           <IonItem>
             <IonLabel>

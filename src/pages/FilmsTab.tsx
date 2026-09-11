@@ -22,9 +22,10 @@ import {
   IonToast,
   IonRefresher,
   IonRefresherContent,
+  IonChip,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, downloadOutline, filmOutline, starOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, downloadOutline, filmOutline, starOutline, sparklesOutline } from 'ionicons/icons';
 import { useHistory } from 'react-router-dom';
 import {
   fetchFilms,
@@ -47,6 +48,7 @@ import { transmissionPath } from '../services/settings';
 import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
 import { buildAllocineUrl } from '../services/torrentScripts';
+import { fetchSearchIdeas } from '../services/gemini';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import SettingsModal from '../components/SettingsModal';
 import RatingStars from '../components/RatingStars';
@@ -85,6 +87,10 @@ const FilmsTab: React.FC = () => {
   const [ratingsMap, setRatingsMap] = useState<Record<string, AllocineRatings>>({});
   const ratingsMapRef = useRef<Record<string, AllocineRatings>>({});
   const ratingsFillReq = useRef(0);
+  /** Idées de recherches complémentaires (Gemini) pour la requête en cours. */
+  const [ideas, setIdeas] = useState<string[]>([]);
+  const [ideasLoading, setIdeasLoading] = useState(false);
+  const [ideasError, setIdeasError] = useState('');
 
   const hasKey = settings.tr4kerApiKey !== '';
 
@@ -115,7 +121,37 @@ const FilmsTab: React.FC = () => {
   // Recharge à chaque changement de catégorie / période / recherche validée.
   useEffect(() => {
     void loadItems(categoryKey, period, query, 1, false);
+    // Idées IA liées à l'ancienne requête : périmées.
+    setIdeas([]);
+    setIdeasError('');
   }, [categoryKey, period, query, loadItems]);
+
+  /** Demande à Gemini des recherches complémentaires (tap → relance la recherche). */
+  async function loadIdeas() {
+    const q = query.trim();
+    if (!q || ideasLoading) return;
+    if (!settings.geminiApiKey) {
+      setIdeasError('Clé API Gemini manquante : Réglages > IA Gemini.');
+      return;
+    }
+    setIdeasLoading(true);
+    setIdeasError('');
+    try {
+      const context = films.slice(0, 8).map((f) => f.title);
+      setIdeas(await fetchSearchIdeas(settings.geminiApiKey, q, category.label, context, settings.geminiModel));
+    } catch (e) {
+      setIdeasError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIdeasLoading(false);
+    }
+  }
+
+  function runIdea(idea: string) {
+    const v = idea.trim();
+    if (!v) return;
+    setQueryInput(v);
+    setQuery(v);
+  }
 
   // Notes Allociné en arrière-plan (films + séries uniquement).
   useEffect(() => {
@@ -301,6 +337,37 @@ const FilmsTab: React.FC = () => {
               </small>
             </IonText>
           </p>
+          {query.trim() !== '' && (
+            <div>
+              {ideas.length === 0 && !ideasLoading && (
+                <IonButton size="small" fill="outline" onClick={() => void loadIdeas()}>
+                  <IonIcon icon={sparklesOutline} slot="start" />
+                  Idées de recherche IA
+                </IonButton>
+              )}
+              {ideasLoading && (
+                <p>
+                  <IonSpinner style={{ width: 16, height: 16 }} />
+                  <IonText color="medium"> Idées en cours…</IonText>
+                </p>
+              )}
+              {!!ideasError && (
+                <p>
+                  <IonText color="danger">{ideasError}</IonText>
+                </p>
+              )}
+              {ideas.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '4px 0 8px' }}>
+                  {ideas.map((idea) => (
+                    <IonChip key={idea} outline onClick={() => runIdea(idea)}>
+                      <IonIcon icon={sparklesOutline} color="tertiary" />
+                      <IonLabel>{idea}</IonLabel>
+                    </IonChip>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {loading && films.length === 0 ? (

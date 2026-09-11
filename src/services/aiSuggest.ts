@@ -1,13 +1,10 @@
 /**
- * Noyau partagé des suggestions IA (films/séries absents de la collection).
+ * Noyau des suggestions IA (films/séries absents de la collection),
+ * branché sur Gemini.
  *
- * Un seul moteur pour tous les providers (Gemini, OpenRouter...) :
- * construction du prompt, extraction JSON tolérante, anti-doublon
+ * Construction du prompt, extraction JSON tolérante, anti-doublon
  * (collection + historique + « déjà vu »), boucle de replis modèles,
  * timeouts et messages d'erreur en français.
- *
- * Chaque provider ne fournit que ses hooks (endpoint, format de réponse,
- * mapping d'erreurs) dans ~60 lignes. Voir gemini.ts / openrouter.ts.
  */
 
 export interface AiLibraryEntry {
@@ -281,6 +278,21 @@ export function extractJson(text: string, displayName: string): unknown {
   );
 }
 
+/** Extrait le motif amont d'un corps d'erreur (JSON {"error":{"message"}} ou texte). */
+export function shortUpstreamReason(body: string, maxLen = 160): string {
+  const raw = (body || '').trim();
+  if (!raw) return 'réponse vide';
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: unknown; code?: unknown } };
+    const msg = String(parsed.error?.message ?? '').trim();
+    if (msg) return msg.length > maxLen ? `${msg.slice(0, maxLen)}…` : msg;
+  } catch {
+    /* pas du JSON : suite */
+  }
+  const flat = raw.replace(/\s+/g, ' ').trim();
+  return flat.length > maxLen ? `${flat.slice(0, maxLen)}…` : flat;
+}
+
 /** Normalise un titre pour l'anti-doublon (accents, casse, ponctuation, &/and). */
 export function normTitle(s: string): string {
   return (s || '')
@@ -290,6 +302,74 @@ export function normTitle(s: string): string {
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+}
+
+/** Mots vides FR/EN ignorés par la comparaison floue (articles, prépositions). */
+const FUZZY_STOPWORDS = new Set([
+  'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'au', 'aux', 'et', 'en', 'dans', 'sur', 'pour',
+  'avec', 'sans', 'sous', 'par', 'plus', 'moins', 'the', 'a', 'an', 'of', 'and', 'to', 'in', 'on',
+  'at', 'for', 'with',
+]);
+
+/** Tokens significatifs d'un titre normalisé (longs + non vides de sens). */
+function sigTokens(normed: string): string[] {
+  return normed.split(' ').filter((t) => t.length > 2 && !FUZZY_STOPWORDS.has(t));
+}
+
+function yearOf(v: unknown): string | undefined {
+  return String(v ?? '').trim().match(/\d{4}/)?.[0];
+}
+
+export interface OwnedIndex {
+  /** Titres exacts normalisés. */
+  exact: Set<string>;
+  /** Par année : tokens significatifs (variantes de formulation). */
+  byYear: Map<string, string[][]>;
+}
+
+/** Index d'exclusion : collection + historique + « déjà vu ». */
+export function buildOwnedIndex(entries: Array<{ title: string; year?: string }>): OwnedIndex {
+  const exact = new Set<string>();
+  const byYear = new Map<string, string[][]>();
+  for (const e of entries) {
+    const n = normTitle(e.title);
+    if (!n) continue;
+    exact.add(n);
+    const y = yearOf(e.year);
+    if (!y) continue;
+    const toks = sigTokens(n);
+    if (toks.length === 0) continue;
+    const arr = byYear.get(y) ?? [];
+    arr.push(toks);
+    byYear.set(y, arr);
+  }
+  return { exact, byYear };
+}
+
+/**
+ * Exclu si titre exact OU variante (même année + tokens significatifs du
+ * titre le plus court tous présents dans l'autre). Attrape « Le Comte de
+ * Monte-Cristo » vs « Comte de Monte Cristo » là où l'exact échoue.
+ * Les titres courts (< 2 tokens significatifs) ou sans année restent en
+ * exact uniquement (pas de faux positifs type « Up » / « Ça »).
+ */
+export function isOwned(rec: { title: string; year?: string }, index: OwnedIndex): { excluded: boolean; fuzzy: boolean } {
+  const n = normTitle(rec.title);
+  if (!n) return { excluded: false, fuzzy: false };
+  if (index.exact.has(n)) return { excluded: true, fuzzy: false };
+  const y = yearOf(rec.year);
+  if (!y) return { excluded: false, fuzzy: false };
+  const rt = sigTokens(n);
+  if (rt.length < 2) return { excluded: false, fuzzy: false };
+  const cands = index.byYear.get(y);
+  if (!cands) return { excluded: false, fuzzy: false };
+  for (const ot of cands) {
+    const [small, big] = rt.length <= ot.length ? [rt, ot] : [ot, rt];
+    if (small.length < 2) continue;
+    const bigSet = new Set(big);
+    if (small.every((t) => bigSet.has(t))) return { excluded: true, fuzzy: true };
+  }
+  return { excluded: false, fuzzy: false };
 }
 
 export function normalizeRecommendation(raw: Record<string, unknown>): AiRecommendation | null {
@@ -306,13 +386,24 @@ export function normalizeRecommendation(raw: Record<string, unknown>): AiRecomme
   return { title, year, type, reason: String(raw['reason'] ?? raw['pourquoi'] ?? '').trim() };
 }
 
-export async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  ms: number,
+  externalSignal?: AbortSignal,
+): Promise<Response> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
+  const onExternalAbort = () => ctrl.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) ctrl.abort();
+    else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
   try {
     return await fetch(url, { ...init, signal: ctrl.signal });
   } finally {
     clearTimeout(t);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
   }
 }
 
@@ -361,9 +452,9 @@ export function markModelDead(namespace: string, model: string): void {
 // ---------- Moteur générique ----------
 
 export interface SuggestProvider {
-  /** Tag court (logs, cache). Ex : 'gemini', 'openrouter'. */
+  /** Tag court (logs, cache). Ex : 'gemini'. */
   tag: string;
-  /** Nom affiché (messages). Ex : 'Gemini', 'OpenRouter'. */
+  /** Nom affiché (messages). Ex : 'Gemini'. */
   display: string;
   /** Indication réglages. Ex : 'Réglages > IA Gemini'. */
   settingsHint: string;
@@ -385,10 +476,12 @@ export interface SuggestProvider {
   /**
    * Classe un statut HTTP non-OK :
    * - 'next-model' : passer au modèle suivant (404 géré à part, 429, 5xx…).
+   * - { next } : idem, en propageant le motif amont (affiché si tout échoue).
    * - { fatal } : échec définitif (clé invalide…).
-   * Note : le 429 transitoire est d'abord rejoué une fois (Retry-After) par le moteur.
+   * Note : le 429 transitoire est rejoué une fois (Retry-After, sinon 5 s)
+   * par le moteur avant ce classement.
    */
-  onHttpError(status: number, body: string): 'next-model' | { fatal: string };
+  onHttpError(status: number, body: string): 'next-model' | { next: string } | { fatal: string };
   /** Message final quand tous les modèles échouent en 404 (catalogue). */
   allFailedMessage(tried: string[], lastDead: string): string;
   /** Message quand tous les modèles tronquent. */
@@ -415,6 +508,15 @@ export async function runSuggest(
   if (!key) throw provider.makeError(`Clé API ${provider.display} manquante (${provider.settingsHint}).`);
   if (library.length === 0) throw provider.makeError('Librairie Plex vide : impossible de générer des suggestions.');
   const t0 = Date.now();
+  const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+  /** Trace console web : chaque étape horodatée (diagnostic lenteur). */
+  const trace = (msg: string) => {
+    try {
+      console.info(`[ai ${provider.tag}][+${elapsed()}] ${msg}`);
+    } catch {
+      /* console indisponible */
+    }
+  };
 
   let requested = (options.model || provider.defaultModel).trim() || provider.defaultModel;
   if (provider.retiredModels?.has(requested)) requested = provider.defaultModel;
@@ -429,12 +531,25 @@ export async function runSuggest(
   let lastDead = '';
   let lastTruncated = '';
   let lastTransient = '';
+  let lastEmpty = '';
   let saturated = false;
+  /** Motifs amont exacts (HTTP 429/5xx) : affichés si tout échoue. */
+  const transientNotes: string[] = [];
+  const noteTransient = (model: string, detail: string) => {
+    if (transientNotes.length < 6) transientNotes.push(`${model} : ${detail}`);
+  };
+  const transientSummary = (): string =>
+    transientNotes.length > 0 ? ` Détails amont : ${transientNotes.slice(0, 3).join(' | ')}` : '';
+  trace(
+    `départ : ${library.length} collection + ${(options.history ?? []).length} historique/déjà-vu, ` +
+      `${options.count ?? 10} demandées (${options.want ?? 'all'}), prompt ${prompt.length} car., ` +
+      `maxTokens ${maxTokens}, modèles : ${toTry.join(', ') || '(aucun)'}`,
+  );
 
-  const callModel = async (model: string, jsonMode: boolean): Promise<Response> => {
+  const callModel = async (model: string, jsonMode: boolean, signal?: AbortSignal): Promise<Response> => {
     const { url, init } = provider.buildRequest(key, model, prompt, jsonMode, maxTokens);
     try {
-      return await fetchWithTimeout(url, init, AI_TIMEOUT_MS);
+      return await fetchWithTimeout(url, init, AI_TIMEOUT_MS, signal);
     } catch (e) {
       throw provider.makeError(
         e instanceof Error && e.name === 'AbortError'
@@ -444,100 +559,195 @@ export async function runSuggest(
     }
   };
 
-  for (const model of toTry) {
-    try {
-      let res = await callModel(model, true);
-      // 429 transitoire : un seul retry honorant Retry-After.
-      if (res.status === 429) {
-        const retryAfter = parseInt(res.headers.get('retry-after') ?? '', 10);
-        await res.text().catch(() => '');
-        if (Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 60) {
-          await wait(retryAfter * 1000);
-          res = await callModel(model, true);
-        }
-      }
-      if (res.status === 404) {
-        lastDead = model;
-        if (provider.cacheDeadModels) markModelDead(provider.tag, model);
-        await res.text().catch(() => '');
-        continue;
-      }
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        const decision = provider.onHttpError(res.status, errBody);
-        if (decision === 'next-model') {
-          if (res.status === 429) saturated = true;
-          else lastTransient = model;
-          continue;
-        }
-        throw provider.makeError(decision.fatal);
-      }
-      let data = (await res.json()) as unknown;
-      let text = provider.extractText(data, model);
-      let parsed: unknown;
-      try {
-        parsed = extractJson(text, provider.display);
-      } catch {
-        // Repli : certains modèles ignorent le mode JSON → retente en texte libre.
-        res = await callModel(model, false);
-        if (!res.ok) throw provider.makeError(`${provider.display} a retourné HTTP ${res.status}.`);
-        data = (await res.json()) as unknown;
-        text = provider.extractText(data, model);
-        parsed = extractJson(text, provider.display); // si ça échoue, l'erreur contient un extrait
-      }
-      const list = Array.isArray(parsed) ? parsed : (parsed as { recommendations?: unknown })['recommendations'];
-      if (!Array.isArray(list)) throw provider.makeError(`Format inattendu de la réponse ${provider.display}.`);
-      const out: AiRecommendation[] = [];
-      // Anti-doublon normalisé : collection + historique + « déjà vu ».
-      const owned = new Set(library.map((e) => normTitle(e.title)));
-      for (const h of options.history ?? []) owned.add(normTitle(h.title));
-      for (const item of list) {
-        if (typeof item !== 'object' || item === null) continue;
-        const rec = normalizeRecommendation(item as Record<string, unknown>);
-        if (!rec) continue;
-        if (owned.has(normTitle(rec.title))) continue;
-        out.push(rec);
-      }
-      if (out.length === 0) {
-        throw provider.makeError(
-          `${provider.display} n’a proposé que des titres déjà dans ta collection ou déjà vus. Relance la génération.`,
-        );
-      }
-      try {
-        if (typeof console !== 'undefined') console.info(`[${provider.tag}] suggestions via ${model} en ${Date.now() - t0} ms`);
-      } catch {
-        /* ignore */
-      }
-      return out;
-    } catch (e) {
-      if (e instanceof AiRetryable) {
-        if (e.kind === 'dead') {
-          lastDead = model;
-          if (provider.cacheDeadModels) markModelDead(provider.tag, model);
-        } else if (e.kind === 'truncated') {
-          lastTruncated = model;
-        } else {
-          lastTransient = model;
-        }
-        continue;
-      }
-      throw e;
+  /**
+   * Une tentative complète sur UN modèle : JSON → parse → repli texte libre
+   * → filtre anti-doublon. Résout les recs (≥1) en cas de succès, [] si tout
+   * est déjà vu ; sinon lève AiRetryable (essayer un autre modèle) ou
+   * l'erreur fatale du provider. `signal` annule les fetchs si un concurrent
+   * gagne la vague.
+   */
+  const RACE_WIDTH = 3;
+  const attemptModel = async (model: string, signal?: AbortSignal): Promise<AiRecommendation[]> => {
+    trace(`${model} : tentative JSON`);
+    const m0 = Date.now();
+    let res = await callModel(model, true, signal);
+    trace(`${model} : HTTP ${res.status} en ${((Date.now() - m0) / 1000).toFixed(1)}s`);
+    // 429 : rejoue UNE fois le même modèle après attente (Retry-After
+    // honoré, sinon 5 s) — la saturation :free est souvent transitoire.
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get('retry-after') ?? '', 10);
+      await res.text().catch(() => '');
+      const delayMs =
+        Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) * 1000 : 5000;
+      trace(`${model} : 429 → attente ${(delayMs / 1000).toFixed(0)}s + 1 retry`);
+      await wait(delayMs);
+      if (signal?.aborted) throw new AiRetryable(`${model} : annulé (vague gagnée ailleurs)`, 'transient');
+      const r0 = Date.now();
+      res = await callModel(model, true, signal);
+      trace(`${model} : retry → HTTP ${res.status} en ${((Date.now() - r0) / 1000).toFixed(1)}s`);
     }
+    if (res.status === 404) {
+      if (provider.cacheDeadModels) markModelDead(provider.tag, model);
+      await res.text().catch(() => '');
+      throw new AiRetryable(`Modèle retiré (${model})`, 'dead');
+    }
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      const decision = provider.onHttpError(res.status, errBody);
+      if (decision === 'next-model' || (typeof decision === 'object' && 'next' in decision)) {
+        if (typeof decision === 'object') noteTransient(model, decision.next);
+        else if (res.status === 429 || res.status >= 500) {
+          noteTransient(model, `HTTP ${res.status} : ${shortUpstreamReason(errBody)}`);
+        }
+        if (res.status === 429) saturated = true;
+        throw new AiRetryable(`${model} : HTTP ${res.status}`, 'transient');
+      }
+      throw provider.makeError(decision.fatal);
+    }
+    let data = (await res.json()) as unknown;
+    let text = provider.extractText(data, model);
+    trace(`${model} : texte ${text.length} car.`);
+    let parsed: unknown;
+    const p0 = Date.now();
+    try {
+      parsed = extractJson(text, provider.display);
+      trace(`${model} : JSON OK en ${Date.now() - p0}ms`);
+    } catch {
+      // Repli : certains modèles ignorent le mode JSON → retente en texte libre.
+      trace(`${model} : JSON illisible → repli texte libre`);
+      if (signal?.aborted) throw new AiRetryable(`${model} : annulé (vague gagnée ailleurs)`, 'transient');
+      res = await callModel(model, false, signal);
+      if (!res.ok) throw provider.makeError(`${provider.display} a retourné HTTP ${res.status}.`);
+      data = (await res.json()) as unknown;
+      text = provider.extractText(data, model);
+      parsed = extractJson(text, provider.display); // si ça échoue, l'erreur contient un extrait
+    }
+    const list = Array.isArray(parsed) ? parsed : (parsed as { recommendations?: unknown })['recommendations'];
+    if (!Array.isArray(list)) throw provider.makeError(`Format inattendu de la réponse ${provider.display}.`);
+    const out: AiRecommendation[] = [];
+    // Anti-doublon : collection + historique + « déjà vu » (exact + variantes).
+    const owned = buildOwnedIndex([...library, ...(options.history ?? [])]);
+    let nExact = 0;
+    let nFuzzy = 0;
+    for (const item of list) {
+      if (typeof item !== 'object' || item === null) continue;
+      const rec = normalizeRecommendation(item as Record<string, unknown>);
+      if (!rec) continue;
+      const chk = isOwned({ title: rec.title, year: rec.year }, owned);
+      if (chk.excluded) {
+        if (chk.fuzzy) nFuzzy += 1;
+        else nExact += 1;
+        continue;
+      }
+      out.push(rec);
+    }
+    trace(`${model} : ${list.length} brutes → ${out.length} retenues (${nExact} exactes + ${nFuzzy} variantes exclues)`);
+    if (out.length === 0) {
+      lastEmpty = model;
+      return [];
+    }
+    return out;
+  };
+
+  /**
+   * Vague parallèle : jusqu'à RACE_WIDTH modèles concourent, le premier avec
+   * ≥1 retenue gagne et les autres sont annulés. Contre les files :free
+   * imprévisibles, 3 files parallèles valent mieux qu'une loterie séquentielle.
+   * Résout null si tous écartés (détails déjà tracés/enregistrés) ; propage
+   * l'erreur fatale s'il y en a une et aucun gagnant.
+   */
+  const attemptWave = async (wave: string[]): Promise<{ model: string; recs: AiRecommendation[] } | null> => {
+    const ctrls = wave.map(() => new AbortController());
+    let done = false;
+    let settledCount = 0;
+    let fatal: unknown = null;
+    trace(`vague [${wave.join(', ')}] : ${wave.length} tentative(s) en parallèle`);
+    return new Promise((resolve, reject) => {
+      const checkEnd = () => {
+        if (done || settledCount < wave.length) return;
+        done = true;
+        if (fatal !== null && fatal !== undefined) reject(fatal);
+        else resolve(null);
+      };
+      wave.forEach((m, k) => {
+        attemptModel(m, ctrls[k].signal).then(
+          (out) => {
+            if (done) return;
+            if (out.length > 0) {
+              done = true;
+              ctrls.forEach((c, j) => {
+                if (j !== k) {
+                  try {
+                    c.abort();
+                  } catch {
+                    /* ignore */
+                  }
+                }
+              });
+              try {
+                if (typeof console !== 'undefined') console.info(`[${provider.tag}] suggestions via ${m} en ${Date.now() - t0} ms`);
+              } catch {
+                /* ignore */
+              }
+              trace(`OK via ${m} en ${elapsed()} (${out.length} retenues) — concurrents annulés`);
+              resolve({ model: m, recs: out });
+            } else {
+              settledCount += 1;
+              checkEnd();
+            }
+          },
+          (e: unknown) => {
+            if (done) return;
+            if (e instanceof AiRetryable) {
+              trace(`${m} : écarté (${e.kind}) — ${(e.message || '').slice(0, 180)}`);
+              if (e.kind === 'dead') {
+                lastDead = m;
+                if (provider.cacheDeadModels) markModelDead(provider.tag, m);
+              } else if (e.kind === 'truncated') {
+                lastTruncated = m;
+              } else {
+                lastTransient = m;
+              }
+            } else {
+              fatal = e;
+            }
+            settledCount += 1;
+            checkEnd();
+          },
+        );
+      });
+    });
+  };
+
+  for (let wi = 0; wi < toTry.length; wi += RACE_WIDTH) {
+    const wave = toTry.slice(wi, wi + RACE_WIDTH);
+    // Pacing entre vagues : les :free saturent vite, on espace.
+    if (wi > 0) {
+      trace(`pacing 2 s avant vague suivante`);
+      await wait(2000);
+    }
+    const win = await attemptWave(wave);
+    if (win) return win.recs;
   }
   if (lastTruncated && !lastDead && !saturated && !lastTransient) {
     throw provider.makeError(provider.truncatedMessage(lastTruncated));
   }
   if (saturated && !lastDead) {
     throw provider.makeError(
-      `Tous les modèles ${provider.display} sont saturés ou quota épuisé (429 / amont sur : ${toTry.join(', ')}). ` +
+      `Tous les modèles ${provider.display} sont saturés (429 / amont sur : ${toTry.join(', ')}). ` +
         (provider.saturatedDetail ? provider.saturatedDetail + ' ' : '') +
-        `Réessaie dans quelques minutes.`,
+        `Réessaie dans quelques minutes.${transientSummary()}`,
     );
   }
   if (lastTransient && !lastDead && !saturated) {
     throw provider.makeError(
       `Fournisseurs ${provider.display} temporairement indisponibles (amont saturé sur : ${toTry.join(', ')}). ` +
-        `Réessaie dans quelques minutes.`,
+        `Réessaie dans quelques minutes.${transientSummary()}`,
+    );
+  }
+  if (lastEmpty && !lastDead && !saturated && !lastTransient && !lastTruncated) {
+    throw provider.makeError(
+      `${provider.display} n’a proposé que des titres déjà dans ta collection ou déjà vus. Relance la génération.`,
     );
   }
   throw provider.makeError(provider.allFailedMessage(toTry, lastDead));

@@ -11,6 +11,8 @@
  */
 import {
   AiRetryable,
+  extractJson,
+  fetchWithTimeout,
   runSuggest,
   type AiLibraryEntry,
   type AiMediaType,
@@ -129,4 +131,140 @@ export async function fetchGeminiRecommendations(
   options: GeminiSuggestOptions = {},
 ): Promise<GeminiRecommendation[]> {
   return runSuggest(provider, apiKey, library, options);
+}
+
+/**
+ * Idées de recherches complémentaires : l'utilisateur a cherché `query`
+ * dans le catalogue (TR4KER), Gemini propose des requêtes voisines
+ * (même auteur/réalisateur, saga, genre, ambiance). Tap → relance la recherche.
+ */
+export async function fetchSearchIdeas(
+  apiKey: string,
+  query: string,
+  categoryLabel: string,
+  contextTitles: string[] = [],
+  model?: string,
+): Promise<string[]> {
+  const key = (apiKey || '').trim();
+  if (!key) throw new GeminiError('Clé API Gemini manquante (Réglages > IA Gemini).');
+  const q = (query || '').trim();
+  if (!q) throw new GeminiError('Recherche vide.');
+  const context = contextTitles
+    .map((t) => (t || '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  const prompt =
+    `L'utilisateur recherche « ${q} » dans un catalogue de torrents (${categoryLabel}).` +
+    (context.length > 0 ? `\nTitres trouvés : ${context.join(' | ')}.` : '') +
+    `\nPropose 6 recherches complémentaires courtes (titres ou mots-clés, même catégorie) : ` +
+    `œuvres proches — même auteur/réalisateur, saga, genre ou ambiance.` +
+    `\nRéponds UNIQUEMENT avec un objet JSON valide, sans markdown ni texte autour : {"ideas": ["...", ...]}.` +
+    `\nRègles : une idée courte par entrée, une seule ligne, jamais de guillemets doubles dans les valeurs, ` +
+    `jamais la recherche d'origine elle-même.`;
+  return geminiJsonIdeas(key, prompt, 'ideas', new Set([q.toLowerCase()]), model);
+}
+
+/**
+ * Pistes de recherche suivantes : après une génération de suggestions IA,
+ * propose d'autres angles d'exploration (envies utilisables telles quelles
+ * dans le champ d'intention : genre voisin, ambiance, époque, auteur...).
+ */
+export async function fetchFollowUpIdeas(
+  apiKey: string,
+  recs: Array<{ title: string; year?: string }>,
+  intent?: string,
+  model?: string,
+): Promise<string[]> {
+  const key = (apiKey || '').trim();
+  if (!key) throw new GeminiError('Clé API Gemini manquante (Réglages > IA Gemini).');
+  const items = (recs ?? [])
+    .map((r) => `${(r.title || '').trim()}${r.year ? ` (${r.year})` : ''}`.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  if (items.length === 0) throw new GeminiError('Aucune suggestion à prolonger.');
+  const want = (intent || '').trim();
+  const prompt =
+    `Tu viens de recommander ces films/séries : ${items.join(' | ')}.` +
+    (want ? `\nIntention de départ de l'utilisateur : « ${want} ».` : '') +
+    `\nPropose 6 autres pistes de recherche : des envies courtes en français, utilisables telles quelles ` +
+    `pour affiner la prochaine génération (genre voisin, ambiance, époque, auteur/réalisateur, saga...).` +
+    `\nRéponds UNIQUEMENT avec un objet JSON valide, sans markdown ni texte autour : {"ideas": ["...", ...]}.` +
+    `\nRègles : une piste courte par entrée, une seule ligne, jamais de guillemets doubles dans les valeurs, ` +
+    `jamais un titre déjà recommandé, jamais l'intention d'origine telle quelle.`;
+  const exclude = new Set(items.map((t) => t.toLowerCase()));
+  if (want) exclude.add(want.toLowerCase());
+  return geminiJsonIdeas(key, prompt, 'ideas', exclude, model, 512, 6);
+}
+
+/** Appel JSON générique (idées) : prompt → liste de chaînes dédupliquées. */
+async function geminiJsonIdeas(
+  key: string,
+  prompt: string,
+  resultKey: string,
+  excludeNorm: Set<string>,
+  model?: string,
+  maxTokens = 512,
+  maxIdeas = 8,
+): Promise<string[]> {
+  let requested = (model || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
+  if (RETIRED_GEMINI_MODELS.has(requested)) requested = DEFAULT_GEMINI_MODEL;
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.8, maxOutputTokens: maxTokens, responseMimeType: 'application/json' },
+  });
+  const models = [requested, ...GEMINI_MODEL_FALLBACKS.filter((m) => m !== requested)];
+  let lastErr = '';
+  for (const m of models) {
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(key)}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+        30000,
+      );
+    } catch (e) {
+      lastErr = e instanceof Error && e.name === 'AbortError' ? 'délai dépassé' : e instanceof Error ? e.message : String(e);
+      continue;
+    }
+    if (res.status === 404) {
+      lastErr = `"${m}" introuvable`;
+      continue;
+    }
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '').then((t) => t.slice(0, 200));
+      if (res.status === 400 && /API key not valid|API_KEY_INVALID/i.test(errBody)) {
+        throw new GeminiError('Clé API Gemini invalide. Vérifie-la dans Réglages > IA Gemini.');
+      }
+      lastErr = `HTTP ${res.status}`;
+      continue;
+    }
+    const data = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+    if (!text.trim()) {
+      lastErr = 'réponse vide';
+      continue;
+    }
+    const parsed = extractJson(text, 'Gemini') as Record<string, unknown> | unknown[];
+    const list = Array.isArray(parsed) ? parsed : parsed[resultKey];
+    if (!Array.isArray(list)) {
+      lastErr = 'format inattendu';
+      continue;
+    }
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const item of list) {
+      const s = String(item ?? '').trim();
+      if (!s || s.length > 80) continue;
+      const k = s.toLowerCase();
+      if (excludeNorm.has(k) || seen.has(k)) continue;
+      seen.add(k);
+      out.push(s);
+      if (out.length >= maxIdeas) break;
+    }
+    if (out.length > 0) return out;
+    lastErr = 'aucune idée exploitable';
+  }
+  throw new GeminiError(`Idées IA indisponibles (${lastErr}). Relance dans un moment.`);
 }

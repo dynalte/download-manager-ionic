@@ -61,8 +61,6 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
   const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-3.5-flash-lite');
-  const [openrouterApiKey, setOpenrouterApiKey] = useStored(Keys.openrouterApiKey, '');
-  const [openrouterModel, setOpenrouterModel] = useStored(Keys.openrouterModel, 'google/gemma-4-26b-a4b-it:free');
   const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'http://photos2.dynaspirit.com:8080/api-download-manager.php');
   const [seenSyncToken, setSeenSyncToken] = useStored(Keys.seenSyncToken, '');
   const [seenCount, setSeenCount] = useState(0);
@@ -226,19 +224,6 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             >
               {syncTesting ? 'Test…' : 'Tester'}
             </IonButton>
-          </IonItem>
-
-          <IonItem>
-            <IonLabel>
-              <h2>IA OpenRouter (alternative, prioritaire si clé renseignée)</h2>
-              <p>Clé gratuite sur openrouter.ai/keys (modèles :free, sans CB). Remplace Gemini quand elle est renseignée.</p>
-            </IonLabel>
-          </IonItem>
-          <IonItem>
-            <IonInput label="Clé API OpenRouter" labelPlacement="stacked" type="password" value={openrouterApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setOpenrouterApiKey(String(e.detail.value ?? ''))} placeholder="sk-or-v1..." />
-          </IonItem>
-          <IonItem>
-            <IonInput label="Modèle OpenRouter" labelPlacement="stacked" value={openrouterModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setOpenrouterModel(String(e.detail.value ?? ''))} placeholder="google/gemma-4-26b-a4b-it:free" />
           </IonItem>
 
           <IonItem>

@@ -21,6 +21,7 @@ import {
   IonRefresher,
   IonRefresherContent,
   IonFooter,
+  IonChip,
   RefresherEventDetail,
 } from '@ionic/react';
 import { settingsOutline, refreshOutline, playOutline, eyeOutline, eyeOffOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, downloadOutline, searchOutline } from 'ionicons/icons';
@@ -43,12 +44,12 @@ import {
 } from '../services/plex';
 import { settings, Keys, transmissionPath } from '../services/settings';
 import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
-import { fetchGeminiRecommendations, type GeminiRecommendation } from '../services/gemini';
-import { fetchOpenRouterRecommendations } from '../services/openrouter';
+import { fetchGeminiRecommendations, fetchFollowUpIdeas, type GeminiRecommendation } from '../services/gemini';
 import { searchTorrents, downloadFilmTorrent, formatBytes, type DiscoveryFilm } from '../services/tr4kerDiscovery';
 import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
 import { loadSeenSuggestions, seenKeyFor, seenKeys, type SeenSuggestion } from '../services/seenSuggestions';
+import { buildOwnedIndex, isOwned } from '../services/aiSuggest';
 import { loadSeenMerged, markSeenEverywhere } from '../services/seenSync';
 import { subscriptionIdFor, upsertSubscription } from '../services/seriesWatch';
 import { forgetDeletedSubscription } from '../services/seriesWatch';
@@ -105,6 +106,9 @@ const PlexTab: React.FC = () => {
   const [suggestCount, setSuggestCount] = useState(10);
   const [suggestWant, setSuggestWant] = useState<'all' | 'movies' | 'series'>('all');
   const [semanticQuery, setSemanticQuery] = useState('');
+  /** Pistes de recherche suivantes (Gemini) après une génération. */
+  const [followIdeas, setFollowIdeas] = useState<string[]>([]);
+  const [followLoading, setFollowLoading] = useState(false);
   /** Nombre de vus (historique, même supprimés) exclus des dernières suggestions. */
   const [suggestHistoryCount, setSuggestHistoryCount] = useState(0);
   /** Suggestions marquées « déjà vu » (persistées, exclues des générations). */
@@ -232,11 +236,10 @@ const PlexTab: React.FC = () => {
     };
   }, [libraries, filteredLibraries]);
 
-  async function generateSuggestions() {
-    // Provider IA : OpenRouter si sa clé est renseignée, sinon Gemini.
-    const useOpenRouter = settings.openrouterApiKey !== '';
-    if (!useOpenRouter && !settings.geminiApiKey) {
-      setSuggestError('Clé API manquante : ouvre Réglages > IA OpenRouter (clé gratuite sur openrouter.ai/keys) ou IA Gemini.');
+  async function generateSuggestions(intentOverride?: string) {
+    // Provider IA : Gemini uniquement.
+    if (!settings.geminiApiKey) {
+      setSuggestError('Clé API manquante : ouvre Réglages > IA Gemini (clé gratuite sur aistudio.google.com/apikey).');
       return;
     }
     setSuggestLoading(true);
@@ -244,22 +247,41 @@ const PlexTab: React.FC = () => {
     setDlResults({});
     setDlError({});
     setDlMsg('');
+    setFollowIdeas([]);
     try {
       // Collection COMPLÈTE + historique + « déjà vu » en parallèle
       // (un seul temps d'attente réseau au lieu de trois en chaîne).
+      const tSuggest = Date.now();
+      const sElapsed = () => `${((Date.now() - tSuggest) / 1000).toFixed(1)}s`;
+      const timed = async <T,>(label: string, pr: Promise<T>): Promise<T> => {
+        const s = Date.now();
+        const v = await pr;
+        try {
+          console.info(`[plex][+${sElapsed()}] ${label} en ${((Date.now() - s) / 1000).toFixed(1)}s`);
+        } catch {
+          /* ignore */
+        }
+        return v;
+      };
       const [full, seenLoaded, historyLoaded] = await Promise.all([
-        fetchLibrariesData(
-          settings.plexResolvedBaseURL,
-          settings.plexToken,
-          settings.plexSectionKeys,
-          1000,
-        ).catch(() => null),
-        loadSeenMerged().catch(() => null),
-        fetchWatchHistory(
-          settings.plexResolvedBaseURL,
-          settings.plexToken,
-          300,
-        ).catch(() => []),
+        timed(
+          'bibliothèque Plex',
+          fetchLibrariesData(
+            settings.plexResolvedBaseURL,
+            settings.plexToken,
+            settings.plexSectionKeys,
+            1000,
+          ).catch(() => null),
+        ),
+        timed('déjà-vu', loadSeenMerged().catch(() => null)),
+        timed(
+          'historique Plex',
+          fetchWatchHistory(
+            settings.plexResolvedBaseURL,
+            settings.plexToken,
+            300,
+          ).catch(() => []),
+        ),
       ]);
       // Base la suggestion sur la collection COMPLÈTE (pas les 20 derniers affichés),
       // repli sur la liste déjà chargée si échec.
@@ -279,8 +301,17 @@ const PlexTab: React.FC = () => {
       if (seenLoaded) setSeenList(seenLoaded);
       const history = historyLoaded ?? [];
       setSuggestHistoryCount(history.length);
+      try {
+        console.info(
+          `[plex][+${sElapsed()}] base : ${entries.length} titres collection, ` +
+            `${history.length} historique, ${seen.length} déjà-vu — appel IA…`,
+        );
+      } catch {
+        /* ignore */
+      }
       const seenEntries = seen.map((s) => ({ title: s.t, year: s.y, type: 'unknown' }));
-      const intent = semanticQuery.trim();
+      // Intention : piste tapée (chip) prioritaire sur le champ (setState asynchrone).
+      const intent = (intentOverride ?? semanticQuery).trim();
       const opts = {
         count: suggestCount,
         want: suggestWant,
@@ -288,39 +319,22 @@ const PlexTab: React.FC = () => {
         history: [...history, ...seenEntries],
       };
       let recs;
-      if (useOpenRouter) {
-        try {
-          recs = await fetchOpenRouterRecommendations(settings.openrouterApiKey, entries, {
-            ...opts,
-            model: settings.openrouterModel,
-          });
-        } catch (e) {
-          // Repli inter-provider sur quota/réseau/serveur : OpenRouter :free saturé → Gemini.
-          // (Pas de repli sur clé invalide ou résultat vide : l'erreur reste affichée.)
-          const msg = e instanceof Error ? e.message : String(e);
-          const fallbackable = /429|402|injoignable|délai dépassé|ne répond pas|HTTP 5\d\d/i.test(msg);
-          if (!settings.geminiApiKey || !fallbackable) throw e;
-          try {
-            recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
-              ...opts,
-              model: settings.geminiModel,
-            });
-            setDlMsg('OpenRouter saturé : génération via Gemini.');
-          } catch (e2) {
-            // Les deux providers ont échoué : affiche les deux causes, pas seulement la dernière.
-            const msg2 = e2 instanceof Error ? e2.message : String(e2);
-            throw new Error(`OpenRouter : ${msg}\nRepli Gemini : ${msg2}`);
-          }
-        }
-      } else {
-        recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
-          ...opts,
-          model: settings.geminiModel,
-        });
+      recs = await fetchGeminiRecommendations(settings.geminiApiKey, entries, {
+        ...opts,
+        model: settings.geminiModel,
+      });
+      // Filet local : exclut les « déjà vu » (exact + variantes) même si l'IA les renvoie.
+      const seenIdx = buildOwnedIndex(seen.map((s) => ({ title: s.t, year: s.y })));
+      const before = recs.length;
+      const kept = recs.filter((r) => !isOwned({ title: r.title, year: r.year }, seenIdx).excluded);
+      try {
+        console.info(`[plex][+${sElapsed()}] filet déjà-vu : ${before} → ${kept.length} (${before - kept.length} exclues), total ${sElapsed()}`);
+      } catch {
+        /* ignore */
       }
-      // Filet local : exclut les « déjà vu » même si Gemini les renvoie.
-      const seenSet = seenKeys(seen);
-      setSuggestions(recs.filter((r) => !seenSet.has(seenKeyFor(r.title))));
+      setSuggestions(kept);
+      // Pistes suivantes : chargées en arrière-plan (silencieux si échec).
+      if (kept.length > 0) void loadFollowIdeas(kept, intent);
     } catch (e) {
       setSuggestError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -331,6 +345,27 @@ const PlexTab: React.FC = () => {
   /** Bouton unique : suggestions ABSENTES de Plex, biaisées par l'intention si saisie. */
   async function generateUnified() {
     await generateSuggestions();
+  }
+
+  /** Pistes de recherche suivantes (Gemini) à partir des recos affichées. */
+  async function loadFollowIdeas(recs: GeminiRecommendation[], intent: string) {
+    if (recs.length === 0) return;
+    setFollowLoading(true);
+    try {
+      setFollowIdeas(await fetchFollowUpIdeas(settings.geminiApiKey, recs, intent, settings.geminiModel));
+    } catch {
+      setFollowIdeas([]);
+    } finally {
+      setFollowLoading(false);
+    }
+  }
+
+  /** Tap sur une piste : l'intention est posée puis la génération relancée. */
+  function runFollowIdea(idea: string) {
+    const v = idea.trim();
+    if (!v || suggestLoading) return;
+    setSemanticQuery(v);
+    void generateSuggestions(v);
   }
 
   /** Marque une suggestion comme déjà vue : persistée (local + serveur) + retirée de la liste. */
@@ -934,7 +969,7 @@ const PlexTab: React.FC = () => {
             <div className="detail-sheet">
               <IonText color="medium">
                 <p style={{ marginTop: 0 }}>
-                  {settings.openrouterApiKey !== '' ? 'OpenRouter' : 'Gemini'} analyse les titres de ta librairie Plex ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération{suggestHistoryCount > 0 ? ` + ${suggestHistoryCount} vus (historique, même supprimés)` : ''}{seenList.length > 0 ? ` + ${seenList.length} marqués vus` : ''}) pour proposer des films/séries ni en collection ni déjà vus.
+                  {'Gemini analyse les titres de ta librairie Plex'} ({libraries.reduce((n, l) => n + l.items.length, 0)} affichés, collection complète rechargée à la génération{suggestHistoryCount > 0 ? ` + ${suggestHistoryCount} vus (historique, même supprimés)` : ''}{seenList.length > 0 ? ` + ${seenList.length} marqués vus` : ''}) pour proposer des films/séries ni en collection ni déjà vus.
                 </p>
               </IonText>
               <IonSegment
@@ -990,10 +1025,10 @@ const PlexTab: React.FC = () => {
                   <IonText color="danger">{suggestError}</IonText>
                 </p>
               )}
-              {!settings.geminiApiKey && !settings.openrouterApiKey && !suggestLoading && (
+              {!settings.geminiApiKey && !suggestLoading && (
                 <p>
                   <IonText color="warning">
-                    {'Ajoute ta clé API dans Réglages > IA OpenRouter (gratuite sur openrouter.ai/keys, modèles :free) ou IA Gemini.'}
+                    {'Ajoute ta clé API Gemini dans Réglages > IA Gemini (gratuite sur aistudio.google.com/apikey).'}
                   </IonText>
                 </p>
               )}
@@ -1124,6 +1159,28 @@ const PlexTab: React.FC = () => {
                   </IonItem>
                 ))}
               </IonList>
+            )}
+            {suggestions.length > 0 && (followIdeas.length > 0 || followLoading) && (
+              <div style={{ padding: '4px 16px 4px' }}>
+                <IonText color="medium">
+                  <p style={{ marginBottom: 4 }}>Explorer aussi :</p>
+                </IonText>
+                {followLoading && followIdeas.length === 0 ? (
+                  <p>
+                    <IonSpinner style={{ width: 16, height: 16 }} />
+                    <IonText color="medium"> Pistes en cours…</IonText>
+                  </p>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {followIdeas.map((idea) => (
+                      <IonChip key={idea} outline onClick={() => runFollowIdea(idea)}>
+                        <IonIcon icon={sparklesOutline} color="tertiary" />
+                        <IonLabel>{idea}</IonLabel>
+                      </IonChip>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
             {!!dlMsg && (
               <div style={{ padding: '4px 16px 12px' }}>

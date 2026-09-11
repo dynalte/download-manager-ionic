@@ -27,8 +27,6 @@ export const Keys = {
   plexDisplayMode: 'plex_display_mode',
   geminiApiKey: 'gemini_api_key',
   geminiModel: 'gemini_model',
-  openrouterApiKey: 'openrouter_api_key',
-  openrouterModel: 'openrouter_model',
   seenSyncURL: 'seen_sync_url',
   seenSyncToken: 'seen_sync_token',
 } as const;
@@ -183,14 +181,6 @@ export const settings = {
       return 'gemini-3.5-flash-lite';
     }
     return stored;
-  },
-  /** Clé API OpenRouter (modèles :free, sans CB). Vide = provider désactivé. */
-  get openrouterApiKey(): string {
-    return getString(Keys.openrouterApiKey, '').trim();
-  },
-  get openrouterModel(): string {
-    const stored = getString(Keys.openrouterModel, '').trim();
-    return stored === '' ? 'google/gemma-4-26b-a4b-it:free' : stored;
   },
   /** URL de l'API perso de synchro des « déjà vu » (vide = synchro désactivée). */
   get seenSyncURL(): string {

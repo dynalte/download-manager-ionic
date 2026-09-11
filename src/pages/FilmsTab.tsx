@@ -51,6 +51,7 @@ import { buildAllocineUrl } from '../services/torrentScripts';
 import { fetchSearchIdeas } from '../services/gemini';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import SettingsModal from '../components/SettingsModal';
+import SuggestModal from '../components/SuggestModal';
 import RatingStars from '../components/RatingStars';
 
 const PAGE_SIZE = 25;
@@ -72,6 +73,8 @@ const FilmsTab: React.FC = () => {
   const [query, setQuery] = useState('');
   const [queryInput, setQueryInput] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  /** Modale Suggestions IA (composant partagé Plex + Catalogue). */
+  const [showSuggest, setShowSuggest] = useState(false);
   const [toast, setToast] = useState('');
   const [detail, setDetail] = useState<DiscoveryFilm | null>(null);
   /** Descriptif TR4KER (repli si Allociné sans synopsis). undefined = en cours. */
@@ -273,6 +276,9 @@ const FilmsTab: React.FC = () => {
         <IonToolbar>
           <IonTitle>Catalogue</IonTitle>
           <IonButtons slot="end">
+            <IonButton onClick={() => setShowSuggest(true)} title="Suggestions IA">
+              <IonIcon icon={sparklesOutline} />
+            </IonButton>
             <IonButton onClick={() => setShowSettings(true)}>
               <IonIcon icon={settingsOutline} />
             </IonButton>
@@ -618,6 +624,7 @@ const FilmsTab: React.FC = () => {
           }}
         />
         <IonToast isOpen={toast !== ''} message={toast} duration={3500} onDidDismiss={() => setToast('')} />
+        <SuggestModal isOpen={showSuggest} onClose={() => setShowSuggest(false)} />
       </IonContent>
     </IonPage>
   );

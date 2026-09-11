@@ -313,6 +313,22 @@ export async function fetchDownloads(): Promise<TransmissionDownloadItem[]> {
   }));
 }
 
+/** Espace libre du dossier de téléchargement (octets, `session-stats`). */
+export interface SessionStats {
+  downloadDirFreeSpace: number;
+}
+
+export async function fetchSessionStats(): Promise<SessionStats> {
+  const payload = { method: 'session-stats', tag: 4 };
+  const args = isElectron()
+    ? await electronRpc<{ 'download-dir-free-space'?: number }>(payload)
+    : await withSession<{ 'download-dir-free-space'?: number }>(async (sessionID) =>
+        rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
+      );
+  const free = args['download-dir-free-space'];
+  return { downloadDirFreeSpace: typeof free === 'number' && Number.isFinite(free) && free >= 0 ? free : 0 };
+}
+
 export async function removeTorrent(id: number, deleteLocalData = true): Promise<void> {
   const payload = {
     method: 'torrent-remove',

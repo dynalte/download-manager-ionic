@@ -32,7 +32,7 @@ import { refreshLibraries } from '../services/plex';
 import { settings, folderDisplayName, folderForDownloadDir, type DestinationFolder } from '../services/settings';
 import { ingestDownloads, requestAuthorizationIfNeeded } from '../services/completionMonitor';
 import { appLog } from '../services/debugLog';
-import { wipeRemoteFiles } from '../services/serverApi';
+import { wipeRemoteFiles, fetchDiskSpace, type DiskSpace } from '../services/serverApi';
 import SettingsModal from '../components/SettingsModal';
 
 type Filter = 'active' | 'finished' | 'all' | 'plexWatched' | 'plexUnwatched';
@@ -150,6 +150,7 @@ const TransmissionTab: React.FC = () => {
   const [plexStatus, setPlexStatus] = useState('Plex inactif');
   const [showSettings, setShowSettings] = useState(false);
   const [linkRecords, setLinkRecords] = useState<PlexLinkRecord[]>([]);
+  const [disk, setDisk] = useState<DiskSpace | null>(null);
   const timer = useRef<number | null>(null);
 
   const refreshDownloads = useCallback(async () => {
@@ -163,6 +164,14 @@ const TransmissionTab: React.FC = () => {
       setError(`Erreur lecture Transmission: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoading(false);
+    }
+  }, []);
+
+  const refreshDiskSpace = useCallback(async () => {
+    try {
+      setDisk(await fetchDiskSpace());
+    } catch {
+      /* silencieux : le texte garde la dernière valeur connue */
     }
   }, []);
 
@@ -197,6 +206,7 @@ const TransmissionTab: React.FC = () => {
   useEffect(() => {
     void requestAuthorizationIfNeeded();
     void refreshDownloads();
+    void refreshDiskSpace();
     setPlexStatus(
       !settings.plexToken.trim()
         ? 'Plex: configure le token dans Reglages'
@@ -209,6 +219,7 @@ const TransmissionTab: React.FC = () => {
     const loop = () => {
       timer.current = window.setTimeout(async () => {
         await refreshDownloads();
+        await refreshDiskSpace();
         tick += 1;
         if (tick % 3 === 0) await refreshPlexWatched();
         loop();
@@ -218,7 +229,7 @@ const TransmissionTab: React.FC = () => {
     return () => {
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [refreshDownloads, refreshPlexWatched]);
+  }, [refreshDownloads, refreshDiskSpace, refreshPlexWatched]);
 
   function plexWatchLabel(name: string): string | null {
     const normalized = normalizedTorrentTitle(name);
@@ -270,6 +281,7 @@ const TransmissionTab: React.FC = () => {
 
   async function handleRefresh(event: CustomEvent<RefresherEventDetail>) {
     await refreshDownloads();
+    await refreshDiskSpace();
     await refreshPlexWatched();
     event.detail.complete();
   }
@@ -326,6 +338,25 @@ const TransmissionTab: React.FC = () => {
             </IonSegmentButton>
           ))}
         </IonSegment>
+
+        {disk !== null && (
+          <div style={{ padding: '6px 16px 2px' }}>
+            <IonText color="medium">
+              <small>
+                {disk.freeBytes > 0 || disk.totalBytes > 0 ? (
+                  <>
+                    Espace libre : {disk.freeBytes > 0 ? formatSize(disk.freeBytes) : '0 o'}
+                    {disk.totalBytes > 0 ? ` / ${formatSize(disk.totalBytes)}` : ''}
+                  </>
+                ) : (
+                  'Espace libre : indisponible'
+                )}
+                {disk.path ? ` (${disk.path})` : ''}
+                {disk.source === 'transmission' ? ' • via Transmission' : ''}
+              </small>
+            </IonText>
+          </div>
+        )}
 
         {loading && filtered.length === 0 ? (
           <div style={{ textAlign: 'center', padding: 24 }}>

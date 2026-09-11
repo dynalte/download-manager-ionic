@@ -30,6 +30,11 @@
         location = downloadDir de session (ex /downloads/films),
         name = racine du torrent (fichier ou dossier, sans slash).
         Cage stricte : seuls les dossiers montés sont autorisés.
+      Espace disque (barre d'état onglet Transmission) :
+      GET  ?action=disk_space[&path=/downloads/series]
+                                             → {ok:true, free, total, path}
+        free/total en octets (disk_free_space/disk_total_space).
+        path = location session (défaut /downloads) ; cage WIPE_MAP.
 */
 declare(strict_types=1);
 
@@ -332,4 +337,33 @@ if ($action === 'files_wipe') {
     out(['ok' => true, 'deleted' => !file_exists($target) && !is_link($target)]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe).', 400);
+// ---------- Espace disque (barre d'état onglet Transmission) ----------
+
+if ($action === 'disk_space') {
+    $location = trim((string) ($_GET['path'] ?? ''));
+    if ($location === '' || $location === '/downloads') {
+        // Racine commune : même filesystem que tous les dl-*.
+        $dir = '/var/www/html';
+        $location = '/downloads';
+    } else {
+        // Même cage que files_wipe : préfixes WIPE_MAP uniquement.
+        $dir = null;
+        foreach (WIPE_MAP as $prefix => $cdir) {
+            if ($location === $prefix || str_starts_with($location, $prefix . '/')) {
+                $dir = $cdir . substr($location, strlen($prefix));
+                break;
+            }
+        }
+        if ($dir === null) {
+            fail('Emplacement non autorisé.', 403);
+        }
+    }
+    $free = @disk_free_space($dir);
+    $total = @disk_total_space($dir);
+    if ($free === false || $total === false) {
+        fail('Lecture espace disque impossible.', 500);
+    }
+    out(['ok' => true, 'free' => (int) $free, 'total' => (int) $total, 'path' => $location]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space).', 400);

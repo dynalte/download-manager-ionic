@@ -1,6 +1,7 @@
 // Génère les déclinaisons d'icône depuis assets/icon.svg :
 // icon.png (1024), tailles intermédiaires, icon.ico (multi-résolution Win),
-// favicon web (public/), AppIcon iOS (Assets.xcassets). Usage : node scripts/make-icons.cjs
+// favicon web (public/), AppIcon iOS (Assets.xcassets),
+// launcher Android (mipmap-* + adaptatif). Usage : node scripts/make-icons.cjs
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -57,6 +58,66 @@ async function makeIosIcons(sharp) {
   console.log(`iOS : ${IOS_ICONS.length} icônes AppIcon générées (fond plein, sans alpha).`);
 }
 
+// Jeu launcher Android : legacy 48dp + adaptatif (fond uni + glyphe centré
+// à ~66 % sur transparent, zone sûre respectée).
+const ANDROID_DENSITIES = [
+  { dir: 'mipmap-mdpi', d: 1 },
+  { dir: 'mipmap-hdpi', d: 1.5 },
+  { dir: 'mipmap-xhdpi', d: 2 },
+  { dir: 'mipmap-xxhdpi', d: 3 },
+  { dir: 'mipmap-xxxhdpi', d: 4 },
+];
+const ANDROID_BG = '#4F46E5';
+
+// Variante Android : fond plein-bord (legacy) — même SVG que pour iOS.
+function androidFullBleedSvg() {
+  return iosSvg();
+}
+
+// Glyphe seul sur transparent (1er plan adaptatif) : on retire les 2 rects de fond.
+function androidForegroundSvg() {
+  const src = fs.readFileSync(svg, 'utf8');
+  return src
+    .replace(/<rect[^>]*fill="url\(#bg\)"[^>]*\/>/, '')
+    .replace(/<rect[^>]*fill="url\(#shine\)"[^>]*\/>/, '');
+}
+
+async function makeAndroidIcons(sharp) {
+  const res = path.join(root, 'android', 'app', 'src', 'main', 'res');
+  if (!fs.existsSync(path.join(res, 'mipmap-xxxhdpi'))) {
+    console.log('Android : pas de dossier mipmap (plateforme non ajoutée), ignoré.');
+    return;
+  }
+  const fullBleed = Buffer.from(androidFullBleedSvg());
+  const foregroundSrc = Buffer.from(androidForegroundSvg());
+  for (const { dir, d } of ANDROID_DENSITIES) {
+    const legacy = 48 * d;
+    const out = await sharp(fullBleed, { density: 512 })
+      .resize(legacy, legacy)
+      .flatten({ background: ANDROID_BG })
+      .png()
+      .toBuffer();
+    fs.writeFileSync(path.join(res, dir, 'ic_launcher.png'), out);
+    fs.writeFileSync(path.join(res, dir, 'ic_launcher_round.png'), out);
+    // Adaptatif : canvas 108dp transparent + glyphe 72dp centré.
+    const fgSize = Math.round(108 * d);
+    const glyphSize = Math.round(72 * d);
+    const glyph = await sharp(foregroundSrc, { density: 512 }).resize(glyphSize, glyphSize).png().toBuffer();
+    const fg = await sharp({
+      create: { width: fgSize, height: fgSize, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .composite([{ input: glyph, gravity: 'center' }])
+      .png()
+      .toBuffer();
+    fs.writeFileSync(path.join(res, dir, 'ic_launcher_foreground.png'), fg);
+  }
+  fs.writeFileSync(
+    path.join(res, 'values', 'ic_launcher_background.xml'),
+    `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">${ANDROID_BG}</color>\n</resources>\n`,
+  );
+  console.log('Android : launcher legacy + adaptatif générés depuis assets/icon.svg.');
+}
+
 async function main() {
   const sharp = require('sharp');
   const pngToIcoMod = require('png-to-ico');
@@ -89,6 +150,7 @@ async function main() {
   for (const f of tmp) fs.unlinkSync(f);
   console.log('icones OK : assets/icon.png, assets/icon.ico, public/favicon.svg, public/apple-touch-icon.png');
   await makeIosIcons(sharp);
+  await makeAndroidIcons(sharp);
 }
 
 main().catch((e) => {

@@ -14,6 +14,12 @@ const config: CapacitorConfig = {
       'photos2.dynaspirit.com',
     ],
     cleartext: true,
+    // L'app parle à des services en http:// (Transmission, Plex, synchro).
+    // Avec le scheme https par défaut, la WebView bloque ces appels en
+    // "mixed content" (Failed to fetch) malgré usesCleartextTraffic.
+    // En http, http://localhost reste un contexte sécurisé et les appels
+    // http:// redeviennent même-scheme. iOS non concerné (iosScheme séparé).
+    androidScheme: 'http',
   },
 };
 

@@ -21,17 +21,17 @@ const App: React.FC = () => {
       <IonReactRouter>
         <IonTabs>
           <IonRouterOutlet>
-            <Route exact path="/site">
-              <SiteTab />
-            </Route>
-            <Route exact path="/transmission">
-              <TransmissionTab />
+            <Route exact path="/films">
+              <FilmsTab />
             </Route>
             <Route exact path="/plex">
               <PlexTab />
             </Route>
-            <Route exact path="/films">
-              <FilmsTab />
+            <Route exact path="/transmission">
+              <TransmissionTab />
+            </Route>
+            <Route exact path="/site">
+              <SiteTab />
             </Route>
             <Route exact path="/browser">
               <BrowserTab />
@@ -40,25 +40,25 @@ const App: React.FC = () => {
               <SeriesWatchTab />
             </Route>
             <Route exact path="/">
-              <Redirect to="/site" />
+              <Redirect to="/films" />
             </Route>
           </IonRouterOutlet>
           <IonTabBar slot="bottom">
-            <IonTabButton tab="site" href="/site">
-              <IonIcon icon={globeOutline} />
-              <IonLabel>Site</IonLabel>
-            </IonTabButton>
-            <IonTabButton tab="transmission" href="/transmission">
-              <IonIcon icon={arrowDownCircleOutline} />
-              <IonLabel>Transmission</IonLabel>
+            <IonTabButton tab="films" href="/films">
+              <IonIcon icon={libraryOutline} />
+              <IonLabel>Catalogue</IonLabel>
             </IonTabButton>
             <IonTabButton tab="plex" href="/plex">
               <IonIcon icon={layersOutline} />
               <IonLabel>Plex</IonLabel>
             </IonTabButton>
-            <IonTabButton tab="films" href="/films">
-              <IonIcon icon={libraryOutline} />
-              <IonLabel>Catalogue</IonLabel>
+            <IonTabButton tab="transmission" href="/transmission">
+              <IonIcon icon={arrowDownCircleOutline} />
+              <IonLabel>Transmission</IonLabel>
+            </IonTabButton>
+            <IonTabButton tab="site" href="/site">
+              <IonIcon icon={globeOutline} />
+              <IonLabel>Site</IonLabel>
             </IonTabButton>
             <IonTabButton tab="browser" href="/browser">
               <IonIcon icon={compassOutline} />

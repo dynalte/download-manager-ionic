@@ -20,13 +20,15 @@ import {
   IonRefresher,
   IonRefresherContent,
   IonFooter,
+  IonAlert,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, trashOutline } from 'ionicons/icons';
 import { Capacitor } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import {
   fetchLibrariesData,
+  deletePlexMedia,
   fetchPlayersDetailed,
   fetchSeasonEpisodes,
   fetchShowSeasons,
@@ -39,6 +41,7 @@ import {
   type PlexPlayerTarget,
   type PlexSeasonItem,
 } from '../services/plex';
+import { fetchDownloads, removeTorrent, type TransmissionDownloadItem } from '../services/transmission';
 import { settings, Keys } from '../services/settings';
 import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
@@ -58,6 +61,24 @@ type DisplayMode = 'list' | 'grid';
 
 function getStored(key: string, fallback: string): string {
   return localStorage.getItem(key) ?? fallback;
+}
+
+function normalizedMediaTitle(raw: string): string {
+  return raw
+    .replace(/[._]+/g, ' ')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\b(?:s\d{1,2}(?:e\d{1,3})?|\d{1,2}x\d{1,3}|season|saison)\b.*$/i, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function torrentMatchesPlexItem(item: PlexLibraryItem, torrent: TransmissionDownloadItem): boolean {
+  const media = normalizedMediaTitle(item.title);
+  const candidate = normalizedMediaTitle(torrent.name);
+  if (!media || !candidate) return false;
+  return candidate === media || candidate.startsWith(`${media} `) || media.startsWith(`${candidate} `);
 }
 
 const PlexTab: React.FC = () => {
@@ -92,6 +113,11 @@ const PlexTab: React.FC = () => {
   const ratingsFillReq = useRef(0);
   /** Modale Suggestions IA (composant partagé Plex + Catalogue). */
   const [showSuggest, setShowSuggest] = useState(false);
+  const [pendingDeletion, setPendingDeletion] = useState<{
+    item: PlexLibraryItem;
+    torrents: TransmissionDownloadItem[];
+  } | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   /** Note la plus parlante pour l'affichage compact (spectateurs > presse). */
   function bestNote(r: AllocineRatings): number | null {
@@ -301,6 +327,46 @@ const PlexTab: React.FC = () => {
       } finally {
         setLoadingSeasons(false);
       }
+    }
+  }
+
+  async function prepareDeletion(item: PlexLibraryItem) {
+    if (deleting) return;
+    try {
+      const torrents = (await fetchDownloads()).filter((torrent) => torrentMatchesPlexItem(item, torrent));
+      setPendingDeletion({ item, torrents });
+    } catch {
+      // La suppression Plex reste possible si Transmission est indisponible.
+      setPendingDeletion({ item, torrents: [] });
+    }
+  }
+
+  async function confirmDeletion(removeFromTransmission: boolean) {
+    const target = pendingDeletion;
+    if (!target || deleting) return;
+    setPendingDeletion(null);
+    setDeleting(true);
+    try {
+      await deletePlexMedia(settings.plexResolvedBaseURL, settings.plexToken, target.item.ratingKey);
+      if (removeFromTransmission) {
+        for (const torrent of target.torrents) {
+          // Plex vient de supprimer les fichiers : retirer seulement la tâche Transmission.
+          await removeTorrent(torrent.id, false);
+        }
+      }
+      setDetail(null);
+      setSeason(null);
+      setPlaybackMsg(
+        removeFromTransmission && target.torrents.length > 0
+          ? `${target.item.title} supprimé de Plex et de Transmission.`
+          : `${target.item.title} et ses fichiers ont été supprimés de Plex.`,
+      );
+      await refreshLibraries();
+    } catch (e) {
+      setError(`Suppression impossible : ${e instanceof Error ? e.message : String(e)}`);
+      setPlaybackMsg(`Suppression impossible : ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -637,10 +703,50 @@ const PlexTab: React.FC = () => {
                     Suivre la série
                   </IonButton>
                 )}
+                <IonButton
+                  expand="block"
+                  fill="outline"
+                  color="danger"
+                  disabled={!detail || deleting}
+                  onClick={() => detail && void prepareDeletion(detail)}
+                >
+                  <IonIcon icon={trashOutline} slot="start" />
+                  Supprimer
+                </IonButton>
               </div>
             </IonToolbar>
           </IonFooter>
         </IonModal>
+
+        <IonAlert
+          isOpen={pendingDeletion !== null}
+          onDidDismiss={() => setPendingDeletion(null)}
+          header={`Supprimer ${pendingDeletion?.item.type === 'show' ? 'cette série' : 'ce film'} ?`}
+          message={
+            pendingDeletion
+              ? `${pendingDeletion.item.title} et tous ses fichiers seront supprimés de Plex.${
+                  pendingDeletion.torrents.length > 0
+                    ? ` ${pendingDeletion.torrents.length} torrent(s) correspondant(s) trouvé(s) dans Transmission.`
+                    : ' Aucun torrent correspondant trouvé dans Transmission.'
+                }`
+              : ''
+          }
+          buttons={[
+            { text: 'Annuler', role: 'cancel' },
+            {
+              text: 'Fichiers Plex seulement',
+              role: 'destructive',
+              handler: () => void confirmDeletion(false),
+            },
+            ...(pendingDeletion && pendingDeletion.torrents.length > 0
+              ? [{
+                  text: 'Fichiers + torrent',
+                  role: 'destructive',
+                  handler: () => void confirmDeletion(true),
+                }]
+              : []),
+          ]}
+        />
 
         {/* Episodes de la saison */}
         <IonModal isOpen={season !== null} onDidDismiss={() => setSeason(null)}>

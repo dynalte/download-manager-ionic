@@ -75,6 +75,8 @@ export interface PlexLinkRecord {
   normalizedTitle: string;
   type: string;
   isWatched: boolean;
+  seasonIndex?: number;
+  episodeIndex?: number;
 }
 
 interface ServerContext {
@@ -157,10 +159,14 @@ function isWatchedFields(o: {
   viewOffset: number;
   durationMs?: number;
 }): boolean {
+  // Série / saison : uniquement si TOUS les épisodes sont vus.
+  // viewCount / lastViewedAt sont incrémentés dès le 1er épisode.
+  if (o.type === 'show' || o.type === 'season') {
+    return o.leafCount > 0 && o.viewedLeafCount >= o.leafCount;
+  }
   if (truthyFlag(o.viewedFlag)) return true;
   if (o.viewCount > 0) return true;
   if (o.lastViewedAt && o.lastViewedAt !== '' && o.lastViewedAt !== '0') return true;
-  if (o.type === 'show' || o.type === 'season') return o.leafCount > 0 && o.viewedLeafCount >= o.leafCount;
   if (o.durationMs && o.durationMs > 0 && o.viewOffset > 0) {
     if (o.viewOffset >= 0.9 * o.durationMs || o.viewOffset * 1000 >= 0.9 * o.durationMs) return true;
   }
@@ -467,6 +473,28 @@ export async function fetchLibrariesData(
   return out;
 }
 
+/**
+ * Supprime un film ou une série de Plex ainsi que ses fichiers média.
+ * Le serveur Plex doit autoriser la suppression des médias.
+ */
+export async function deletePlexMedia(
+  baseURLString: string,
+  token: string,
+  ratingKey: string,
+): Promise<void> {
+  if (!ratingKey.trim()) throw new PlexError('Identifiant Plex manquant.');
+  const ctx = await resolveServerContext(baseURLString, token);
+  const url = `${ctx.baseURL}/library/metadata/${encodeURIComponent(ratingKey)}?X-Plex-Token=${encodeURIComponent(token)}`;
+  const res = await fetch(url, { method: 'DELETE', headers: plexHeaders(token) });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    if (res.status === 401 || res.status === 403) {
+      throw new PlexError("Suppression refusée par Plex. Active l’autorisation de suppression des médias sur le serveur.");
+    }
+    throw new PlexError(`Suppression Plex impossible (${res.status}). ${body}`.trim());
+  }
+}
+
 /** Entrée d'historique de visionnage (conservée même si le média est supprimé). */
 export interface PlexHistoryItem {
   title: string;
@@ -660,7 +688,57 @@ export async function fetchLinkRecords(
       const next: PlexLinkRecord = { normalizedTitle: normalized, type: recordType, isWatched: item.isWatched };
       const existing = merged.get(key);
       if (!existing || (!existing.isWatched && next.isWatched)) merged.set(key, next);
-      else if (!existing) merged.set(key, next);
+    }
+    if (section.type !== 'show') continue;
+    const seasonsUrl =
+      `${ctx.baseURL}/library/sections/${section.key}/all?type=3` +
+      `&X-Plex-Container-Start=0&X-Plex-Container-Size=${perSectionLimit}&includeUserState=1`;
+    const seasonsDoc = await getXML(seasonsUrl, settings.plexToken || token);
+    for (const el of Array.from(seasonsDoc.getElementsByTagName('Directory'))) {
+      const showTitle = decodeEntities(el.getAttribute('parentTitle') ?? el.getAttribute('grandparentTitle') ?? '');
+      const normalized = normalizedTitleForMatching(showTitle);
+      const seasonIndex = el.getAttribute('index') ? parseInt(el.getAttribute('index')!, 10) : NaN;
+      if (!normalized || !Number.isFinite(seasonIndex)) continue;
+      const leafCount = intAttr(el, 'leafCount');
+      const viewedLeafCount = intAttr(el, 'viewedLeafCount');
+      const isWatched = leafCount > 0 && viewedLeafCount >= leafCount;
+      merged.set(`season|${normalized}|${seasonIndex}`, {
+        normalizedTitle: normalized,
+        type: 'season',
+        isWatched,
+        seasonIndex,
+      });
+    }
+    const episodesUrl =
+      `${ctx.baseURL}/library/sections/${section.key}/all?type=4&unwatched=0` +
+      `&X-Plex-Container-Start=0&X-Plex-Container-Size=${perSectionLimit}&includeUserState=1`;
+    const episodesDoc = await getXML(episodesUrl, settings.plexToken || token);
+    for (const el of Array.from(episodesDoc.getElementsByTagName('Video'))) {
+      const rawType = (el.getAttribute('type') ?? 'episode').toLowerCase();
+      if (rawType && rawType !== 'episode') continue;
+      const showTitle = decodeEntities(el.getAttribute('grandparentTitle') ?? '');
+      const normalized = normalizedTitleForMatching(showTitle);
+      const seasonIndex = el.getAttribute('parentIndex') ? parseInt(el.getAttribute('parentIndex')!, 10) : NaN;
+      const episodeIndex = el.getAttribute('index') ? parseInt(el.getAttribute('index')!, 10) : NaN;
+      if (!normalized || !Number.isFinite(seasonIndex) || !Number.isFinite(episodeIndex)) continue;
+      const watched = isWatchedFields({
+        type: 'episode',
+        viewCount: intAttr(el, 'viewCount'),
+        viewedLeafCount: 0,
+        leafCount: 0,
+        lastViewedAt: el.getAttribute('lastViewedAt') ?? el.getAttribute('viewedAt') ?? undefined,
+        viewedFlag: el.getAttribute('viewed') ?? undefined,
+        viewOffset: intAttr(el, 'viewOffset'),
+        durationMs: el.getAttribute('duration') ? parseInt(el.getAttribute('duration')!, 10) : undefined,
+      });
+      if (!watched) continue;
+      merged.set(`episode|${normalized}|${seasonIndex}|${episodeIndex}`, {
+        normalizedTitle: normalized,
+        type: 'episode',
+        isWatched: true,
+        seasonIndex,
+        episodeIndex,
+      });
     }
   }
   return [...merged.values()];

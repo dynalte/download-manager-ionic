@@ -95,23 +95,62 @@ function normalizedTorrentTitle(raw: string): string {
     if (/^\d+bit$/.test(t)) continue;
     if (/^(19|20)\d{2}$/.test(t) && kept.length >= 2) break;
     if (/^s\d{1,2}e\d{1,3}$/.test(t)) break;
+    if (/^\d{1,2}x\d{1,3}$/.test(t)) break;
+    if (/^s\d{1,2}$/.test(t)) break;
+    if (t === 'season' || t === 'saison' || t === 'episode' || t === 'ep') break;
     kept.push(t);
     if (kept.length >= 8) break;
   }
-  return kept.join(' ').trim();
+  return normalizedTitleForMatching(kept.join(' ').trim());
 }
 
 function isSeriesLikeTitle(title: string): boolean {
   const lowered = title.toLowerCase();
-  return lowered.includes('season') || lowered.includes('saison') || lowered.includes('serie') || lowered.includes('series');
+  return (
+    lowered.includes('season') ||
+    lowered.includes('saison') ||
+    lowered.includes('serie') ||
+    lowered.includes('series') ||
+    /\bs\d{1,2}\b/.test(lowered)
+  );
 }
 
 function isEpisodeLikeTitle(title: string): boolean {
   const lowered = title.toLowerCase();
   if (lowered.includes('episode')) return true;
   if (/\bs\d{1,2}e\d{1,3}\b/.test(lowered)) return true;
+  if (/\b\d{1,2}x\d{1,3}\b/.test(lowered)) return true;
   if (/\be\d{1,3}\b/.test(lowered)) return true;
   return false;
+}
+
+function isCompleteSeasonPackTitle(title: string): boolean {
+  if (isEpisodeLikeTitle(title)) return false;
+  const lowered = title.toLowerCase();
+  if (/\b(?:season|saison)\s*\d{1,2}\b/.test(lowered)) return true;
+  if (/\bs\d{1,2}\b/.test(lowered)) return true;
+  if (/\b(complete|complet|integrale|int[eé]grale)\b/.test(lowered) && isSeriesLikeTitle(title)) return true;
+  return false;
+}
+
+function parseTorrentSeasonEpisode(title: string): { season: number; episode?: number } | null {
+  const n = title.replace(/[._-]+/g, ' ');
+  let m = /\bs(\d{1,2})\s*e(\d{1,3})\b/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
+  m = /\b(\d{1,2})\s*x\s*(\d{1,3})\b/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
+  m = /\b(?:season|saison)\s*(\d{1,2})\b/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10) };
+  m = /\bs(\d{1,2})\b/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10) };
+  return null;
+}
+
+function plexTitlesMatch(torrentNorm: string, plexNorm: string): boolean {
+  if (!torrentNorm || !plexNorm) return false;
+  if (torrentNorm === plexNorm) return true;
+  if (torrentNorm.startsWith(`${plexNorm} `)) return true;
+  return plexNorm.startsWith(`${torrentNorm} `) && torrentNorm.split(' ').length >= 2;
 }
 
 function formatRate(bytesPerSecond: number): string {
@@ -231,17 +270,42 @@ const TransmissionTab: React.FC = () => {
     };
   }, [refreshDownloads, refreshDiskSpace, refreshPlexWatched]);
 
+  function matchingRecords(normalized: string, type: string): PlexLinkRecord[] {
+    return linkRecords.filter((r) => r.type === type && plexTitlesMatch(normalized, r.normalizedTitle));
+  }
+
   function plexWatchLabel(name: string): string | null {
     const normalized = normalizedTorrentTitle(name);
     if (!normalized) return null;
-    const watchedMovies = new Set(linkRecords.filter((r) => r.type === 'movie' && r.isWatched).map((r) => r.normalizedTitle));
-    const watchedSeries = new Set(linkRecords.filter((r) => r.type === 'show' && r.isWatched).map((r) => r.normalizedTitle));
-    const prefixMatch = (set: Set<string>) => [...set].some((t) => normalized.startsWith(t) || t.startsWith(normalized));
-    if (isSeriesLikeTitle(name)) {
-      if (!isEpisodeLikeTitle(name) && (watchedSeries.has(normalized) || prefixMatch(watchedSeries))) return 'Plex: serie complete vue';
-    } else if (watchedMovies.has(normalized) || prefixMatch(watchedMovies)) {
-      return 'Plex: film vu';
+    const se = parseTorrentSeasonEpisode(name);
+    const shows = matchingRecords(normalized, 'show');
+    const seasons = matchingRecords(normalized, 'season');
+    const episodes = matchingRecords(normalized, 'episode');
+    const movies = matchingRecords(normalized, 'movie');
+    const showFullyWatched = shows.some((r) => r.isWatched);
+    const seasonFullyWatched =
+      se?.season != null && seasons.some((r) => r.seasonIndex === se.season && r.isWatched);
+
+    if (isEpisodeLikeTitle(name) && se?.season != null && se.episode != null) {
+      const episodeWatched = episodes.some(
+        (r) => r.seasonIndex === se.season && r.episodeIndex === se.episode && r.isWatched,
+      );
+      if (episodeWatched) return 'Plex: episode vu';
+      if (seasonFullyWatched || showFullyWatched) return 'Plex: serie vue';
+      return null;
     }
+
+    if (isCompleteSeasonPackTitle(name)) {
+      if (seasonFullyWatched || showFullyWatched) return 'Plex: saison complete vue';
+      return null;
+    }
+
+    if (isSeriesLikeTitle(name)) {
+      if (showFullyWatched) return 'Plex: serie vue';
+      return null;
+    }
+
+    if (movies.some((r) => r.isWatched)) return 'Plex: film vu';
     return null;
   }
 
@@ -252,10 +316,11 @@ const TransmissionTab: React.FC = () => {
   function isLinked(name: string): boolean {
     const normalized = normalizedTorrentTitle(name);
     if (!normalized) return false;
-    const series = isSeriesLikeTitle(name);
-    const pool = linkRecords.filter((r) => (series ? r.type === 'show' : r.type === 'movie')).map((r) => r.normalizedTitle);
-    if (pool.includes(normalized)) return true;
-    return pool.some((t) => normalized.startsWith(t) || t.startsWith(normalized));
+    const series = isSeriesLikeTitle(name) || isEpisodeLikeTitle(name) || isCompleteSeasonPackTitle(name);
+    const pool = linkRecords
+      .filter((r) => (series ? r.type === 'show' : r.type === 'movie'))
+      .map((r) => r.normalizedTitle);
+    return pool.some((t) => plexTitlesMatch(normalized, t));
   }
 
   const filtered = downloads.filter((d) => {

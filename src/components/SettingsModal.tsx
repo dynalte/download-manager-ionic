@@ -31,6 +31,7 @@ import { requestAuthorizationIfNeeded } from '../services/completionMonitor';
 import { loadSeenSuggestions } from '../services/seenSuggestions';
 import { clearSeenEverywhere } from '../services/seenSync';
 import { testServerConnection } from '../services/serverApi';
+import { applyRemoteConfig, fetchRemoteConfig, pushRemoteConfig } from '../services/remoteConfig';
 import { getThemeMode, setThemeMode, type ThemeMode } from '../services/theme';
 
 function useStored(key: string, fallback: string) {
@@ -66,6 +67,75 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [seenCount, setSeenCount] = useState(0);
   const [syncTestMsg, setSyncTestMsg] = useState('');
   const [syncTesting, setSyncTesting] = useState(false);
+  const [syncPullMsg, setSyncPullMsg] = useState('');
+  const [syncPulling, setSyncPulling] = useState(false);
+  const [syncPushing, setSyncPushing] = useState(false);
+
+  /** Répercute la config récupérée sur les champs affichés (les setters
+      useStored persistent déjà en localStorage ; les clés sans champ —
+      filtres Plex — sont écrites par applyRemoteConfig). */
+  function refreshFieldsFromConfig(cfg: Record<string, string>) {
+    const str = (key: string, set: (v: string) => void) => {
+      if (cfg[key] !== undefined) set(cfg[key]);
+    };
+    str(Keys.transmissionRPCURL, setRpcURL);
+    str(Keys.transmissionUsername, setUsername);
+    str(Keys.transmissionPassword, setPassword);
+    str(Keys.folderFilmsPath, setFilmsPath);
+    str(Keys.folderSeriesPath, setSeriesPath);
+    str(Keys.folderMusiquePath, setMusiquePath);
+    str(Keys.folderLivresPath, setLivresPath);
+    str(Keys.fileServerBaseURL, setFileServerURL);
+    str(Keys.fileServerUsername, setFileServerUser);
+    str(Keys.fileServerPassword, setFileServerPass);
+    str(Keys.tr4kerApiKey, setTr4kerApiKey);
+    str(Keys.geminiApiKey, setGeminiApiKey);
+    str(Keys.geminiModel, setGeminiModel);
+    str(Keys.plexBaseURL, setPlexBaseURL);
+    str(Keys.plexToken, setPlexToken);
+    str(Keys.plexSectionKeysCSV, setPlexSectionKeysCSV);
+    if (cfg[Keys.plexUseCloud] !== undefined) {
+      const on = cfg[Keys.plexUseCloud] === '1' || cfg[Keys.plexUseCloud] === 'true';
+      setPlexUseCloudState(on);
+      setSetting(Keys.plexUseCloud, on ? '1' : '0');
+    }
+    if (cfg[Keys.downloadNotificationsEnabled] !== undefined) {
+      const on = cfg[Keys.downloadNotificationsEnabled] !== '0' && cfg[Keys.downloadNotificationsEnabled] !== 'false';
+      setNotificationsEnabledState(on);
+      setSetting(Keys.downloadNotificationsEnabled, on ? '1' : '0');
+    }
+    if (cfg[Keys.downloadPollIntervalSeconds] !== undefined) {
+      const v = parseInt(cfg[Keys.downloadPollIntervalSeconds], 10);
+      if (Number.isFinite(v) && v > 0) {
+        setPollInterval(v);
+        setSetting(Keys.downloadPollIntervalSeconds, String(v));
+      }
+    }
+  }
+
+  function handlePullConfig() {
+    setSyncPulling(true);
+    setSyncPullMsg('');
+    void fetchRemoteConfig()
+      .then(({ config }) => {
+        const n = applyRemoteConfig(config);
+        refreshFieldsFromConfig(config);
+        setSyncPullMsg(
+          n > 0 ? `${n} paramètre(s) récupéré(s) et appliqué(s).` : 'Serveur joignable mais aucune valeur stockée (utilise « Envoyer » depuis une app configurée).',
+        );
+      })
+      .catch((e) => setSyncPullMsg(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSyncPulling(false));
+  }
+
+  function handlePushConfig() {
+    setSyncPushing(true);
+    setSyncPullMsg('');
+    void pushRemoteConfig()
+      .then((saved) => setSyncPullMsg(`${saved} paramètre(s) envoyé(s) vers le serveur.`))
+      .catch((e) => setSyncPullMsg(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSyncPushing(false));
+  }
   useEffect(() => {
     if (isOpen) setSeenCount(loadSeenSuggestions().length);
   }, [isOpen]);
@@ -102,6 +172,67 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       </IonHeader>
       <IonContent>
         <IonList>
+          <IonItem>
+            <IonLabel>
+              <h2>Synchro vus (serveur perso)</h2>
+              <p>Point d’entrée : renseigne l’URL + le token, puis récupère tous les autres réglages.</p>
+            </IonLabel>
+          </IonItem>
+          <IonItem>
+            <IonInput label="URL API synchro" labelPlacement="stacked" value={seenSyncURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncURL(String(e.detail.value ?? ''))} placeholder="http://photos2.dynaspirit.com:8080/api-download-manager.php" />
+          </IonItem>
+          <IonItem>
+            <IonInput label="Token synchro (même que API_TOKEN côté PHP)" labelPlacement="stacked" type="password" value={seenSyncToken} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncToken(String(e.detail.value ?? ''))} placeholder="..." />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>{syncTestMsg || 'Teste la connexion au serveur de synchro.'}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              disabled={syncTesting}
+              onClick={() => {
+                setSyncTesting(true);
+                setSyncTestMsg('');
+                void testServerConnection()
+                  .then((msg) => setSyncTestMsg(msg))
+                  .catch((e) => setSyncTestMsg(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setSyncTesting(false));
+              }}
+            >
+              {syncTesting ? 'Test…' : 'Tester'}
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>
+                {syncPullMsg ||
+                  'Récupère tous les réglages (Transmission, Plex, clés API, dossiers…). « Envoyer » stocke la config actuelle de cette app sur le serveur.'}
+              </p>
+            </IonLabel>
+          </IonItem>
+          <IonItem lines="none">
+            <IonButton
+              size="small"
+              disabled={syncPulling || syncPushing}
+              onClick={handlePullConfig}
+              style={{ flex: 1 }}
+            >
+              {syncPulling ? 'Récupération…' : 'Récupérer les paramètres'}
+            </IonButton>
+            <IonButton
+              size="small"
+              fill="outline"
+              disabled={syncPulling || syncPushing}
+              onClick={handlePushConfig}
+              style={{ flex: 1 }}
+            >
+              {syncPushing ? 'Envoi…' : 'Envoyer vers le serveur'}
+            </IonButton>
+          </IonItem>
+
           <IonItem>
             <IonLabel>
               <h2>Transmission RPC</h2>
@@ -189,40 +320,6 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
               }}
             >
               Effacer
-            </IonButton>
-          </IonItem>
-
-          <IonItem>
-            <IonLabel>
-              <h2>Synchro vus (serveur perso)</h2>
-              <p>Stocke les « déjà vu » dans SQLite via ton API (vide le token = 100 % local).</p>
-            </IonLabel>
-          </IonItem>
-          <IonItem>
-            <IonInput label="URL API synchro" labelPlacement="stacked" value={seenSyncURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncURL(String(e.detail.value ?? ''))} placeholder="http://photos2.dynaspirit.com:8080/api-download-manager.php" />
-          </IonItem>
-          <IonItem>
-            <IonInput label="Token synchro (même que API_TOKEN côté PHP)" labelPlacement="stacked" type="password" value={seenSyncToken} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncToken(String(e.detail.value ?? ''))} placeholder="..." />
-          </IonItem>
-          <IonItem>
-            <IonLabel>
-              <p>{syncTestMsg || 'Teste la connexion au serveur de synchro.'}</p>
-            </IonLabel>
-            <IonButton
-              slot="end"
-              size="small"
-              fill="outline"
-              disabled={syncTesting}
-              onClick={() => {
-                setSyncTesting(true);
-                setSyncTestMsg('');
-                void testServerConnection()
-                  .then((msg) => setSyncTestMsg(msg))
-                  .catch((e) => setSyncTestMsg(e instanceof Error ? e.message : String(e)))
-                  .finally(() => setSyncTesting(false));
-              }}
-            >
-              {syncTesting ? 'Test…' : 'Tester'}
             </IonButton>
           </IonItem>
 

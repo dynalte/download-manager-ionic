@@ -35,6 +35,13 @@
                                              → {ok:true, free, total, path}
         free/total en octets (disk_free_space/disk_total_space).
         path = location session (défaut /downloads) ; cage WIPE_MAP.
+      Config centralisée (Réglages app : 1 token synchro → tout récupéré) :
+      GET  ?action=config_get                  → {ok:true, config:{clé:valeur}, updatedAt}
+      POST ?action=config_set {config:{...}}   → {ok:true, saved:n}
+        Seules les clés de CONFIG_KEYS sont acceptées/stockées (table
+        app_config : clé → valeur + updated_at). Volontairement exclus :
+        seen_sync_url (l'app connaît déjà l'URL qu'elle appelle) et
+        seen_sync_token (c'est le secret d'auth lui-même).
 */
 declare(strict_types=1);
 
@@ -136,6 +143,14 @@ try {
     } catch (Throwable $e) {
         /* colonne déjà présente */
     }
+    // Config centralisée : paramètres app (transmission, plex, clés API...).
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS app_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT \'\',
+            updated_at INTEGER NOT NULL DEFAULT 0
+        )'
+    );
 } catch (Throwable $e) {
     fail('SQLite indisponible (php-sqlite3 ? dossier writable ?) : ' . $e->getMessage(), 500);
 }
@@ -366,4 +381,78 @@ if ($action === 'disk_space') {
     out(['ok' => true, 'free' => (int) $free, 'total' => (int) $total, 'path' => $location]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space).', 400);
+// ---------- Config centralisée (1 token synchro → tous les paramètres) ----------
+
+// Noms = clés localStorage de l'app (services/settings.ts > Keys).
+// seen_sync_url / seen_sync_token volontairement exclus (bootstrap/auth).
+const CONFIG_KEYS = [
+    'transmission_rpc_url_string',
+    'transmission_username',
+    'transmission_password',
+    'transmission_folder_films_path',
+    'transmission_folder_series_path',
+    'transmission_folder_musique_path',
+    'transmission_folder_livres_path',
+    'file_server_base_url',
+    'file_server_username',
+    'file_server_password',
+    'tr4ker_api_key',
+    'gemini_api_key',
+    'gemini_model',
+    'plex_use_cloud',
+    'plex_base_url',
+    'plex_token',
+    'plex_section_keys_csv',
+    'plex_media_filter',
+    'plex_watch_filter',
+    'plex_display_mode',
+    'download_notifications_enabled',
+    'download_poll_interval_seconds',
+];
+const CONFIG_VALUE_MAX = 4000;
+
+if ($action === 'config_get') {
+    $placeholders = implode(',', array_fill(0, count(CONFIG_KEYS), '?'));
+    $stmt = $db->prepare("SELECT key, value FROM app_config WHERE key IN ($placeholders)");
+    $stmt->execute(CONFIG_KEYS);
+    $config = [];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $config[(string) $row['key']] = (string) $row['value'];
+    }
+    $updatedAt = 0;
+    try {
+        $updatedAt = (int) $db->query('SELECT COALESCE(MAX(updated_at), 0) FROM app_config')->fetchColumn();
+    } catch (Throwable $e) {
+        /* ignore */
+    }
+    out(['ok' => true, 'config' => $config, 'updatedAt' => $updatedAt]);
+}
+
+if ($action === 'config_set') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    $config = (is_array($input) ? $input['config'] : null);
+    if (!is_array($config)) {
+        fail('Champ config manquant.', 400);
+    }
+    $allowed = array_flip(CONFIG_KEYS);
+    $stmt = $db->prepare(
+        'INSERT OR REPLACE INTO app_config (key, value, updated_at) VALUES (:k, :v, :at)'
+    );
+    $now = time();
+    $saved = 0;
+    foreach ($config as $k => $v) {
+        $k = (string) $k;
+        if (!isset($allowed[$k])) {
+            continue; // clé inconnue : ignorée (pas d'erreur, compat ascendante)
+        }
+        $v = trim((string) (is_scalar($v) ? $v : ''));
+        if (strlen($v) > CONFIG_VALUE_MAX) {
+            $v = substr($v, 0, CONFIG_VALUE_MAX);
+        }
+        $stmt->execute([':k' => $k, ':v' => $v, ':at' => $now]);
+        $saved++;
+    }
+    out(['ok' => true, 'saved' => $saved]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set).', 400);

@@ -82,6 +82,10 @@ export function parseEpisode(name: string): { season: number; episode: number; i
   if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), isPack: false };
   m = /(?:^|\s)(\d{1,2})\s*x\s*(\d{1,3})(?:\s|$)/i.exec(n);
   if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10), isPack: false };
+  m = /(?:^|\s)s(\d{1,2})(?:\s|$)/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10), episode: 0, isPack: true };
+  m = /(?:^|\s)(?:saison|season)\s*(\d{1,2})(?:\s|$)/i.exec(n);
+  if (m) return { season: parseInt(m[1], 10), episode: 0, isPack: true };
   return null;
 }
 
@@ -616,6 +620,216 @@ export async function forceDownloadCandidate(
   upsertSubscription(sub);
   await notifyEpisode(sub.title, cand.season, cand.episode);
   return `${sub.title} ${fmtSE(cand.season, cand.episode)} → Transmission`;
+}
+
+function padSE(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+function mergeHits(lists: SearchHit[][]): SearchHit[] {
+  const agg = new Map<string, SearchHit>();
+  for (const items of lists) for (const it of items) agg.set(it.slug, it);
+  return [...agg.values()];
+}
+
+async function searchHitsForTarget(
+  query: string,
+  apiKey: string,
+  season: number,
+  episode?: number,
+): Promise<SearchHit[]> {
+  const attempts: Record<string, string>[] = [];
+  if (episode != null && episode > 0) {
+    attempts.push({
+      q: query,
+      limit: '25',
+      search_in: 'title',
+      sort: 'recent',
+      season: String(season),
+      episode: String(episode),
+    });
+    attempts.push({
+      q: `${query} S${padSE(season)}E${padSE(episode)}`,
+      limit: '25',
+      search_in: 'title',
+      sort: 'recent',
+    });
+  }
+  attempts.push({
+    q: query,
+    limit: '25',
+    search_in: 'title',
+    sort: 'recent',
+    season: String(season),
+  });
+  const agg = new Map<string, SearchHit>();
+  for (const params of attempts) {
+    try {
+      const items = await tr4kerSearchRaw(query, apiKey, params);
+      for (const it of items) {
+        if (queryMatchesName(query, it.name)) agg.set(it.slug, it);
+      }
+      if (episode != null && episode > 0) {
+        const found = [...agg.values()].some((it) => {
+          const se = parseEpisode(it.name);
+          return !!se && !se.isPack && se.season === season && se.episode === episode;
+        });
+        if (found) break;
+      } else if ([...agg.values()].some((it) => parseEpisode(it.name)?.season === season)) {
+        break;
+      }
+    } catch (e) {
+      if (!isTooBroadError(e)) throw e;
+    }
+  }
+  return [...agg.values()];
+}
+
+function pickBestEpisode(hits: SearchHit[], season: number, episode: number): SearchHit | null {
+  let best: { hit: SearchHit; score: number } | null = null;
+  for (const hit of hits) {
+    const se = parseEpisode(hit.name);
+    if (!se || se.isPack || se.season !== season || se.episode !== episode) continue;
+    const score = qualityScore(hit.name, hit.seeders);
+    if (score < 0) continue;
+    if (!best || score > best.score) best = { hit, score };
+  }
+  return best?.hit ?? null;
+}
+
+function pickBestSeasonPack(hits: SearchHit[], season: number): SearchHit | null {
+  let best: { hit: SearchHit; score: number } | null = null;
+  for (const hit of hits) {
+    const se = parseEpisode(hit.name);
+    if (!se || !se.isPack || se.season !== season) continue;
+    const score = qualityScore(hit.name, hit.seeders);
+    if (score < 0) continue;
+    if (!best || score > best.score) best = { hit, score };
+  }
+  return best?.hit ?? null;
+}
+
+/** Déjà envoyé vers Transmission (anti-doublon d'un rattrapage / suivi auto). */
+export function hasRetrievedEpisode(sub: SeriesSubscription, season: number, episode: number): boolean {
+  const needle = `|${season}x${episode}`;
+  return sub.addedKeys.some((k) => k.endsWith(needle));
+}
+
+function rememberKeys(sub: SeriesSubscription, keys: string[]): void {
+  const seen = new Set(sub.addedKeys);
+  for (const k of keys) {
+    if (!seen.has(k)) {
+      sub.addedKeys.push(k);
+      seen.add(k);
+    }
+  }
+  if (sub.addedKeys.length > 500) sub.addedKeys = sub.addedKeys.slice(-500);
+}
+
+function maybeAdvanceBase(sub: SeriesSubscription, season: number, episode: number): void {
+  if (episode <= 0) return;
+  if (isNewer({ season, episode }, sub.lastSeason, sub.lastEpisode)) {
+    sub.lastSeason = season;
+    sub.lastEpisode = episode;
+  }
+}
+
+async function ingestHit(
+  sub: SeriesSubscription,
+  hit: SearchHit,
+  keys: Array<{ season: number; episode: number }>,
+  apiKey: string,
+): Promise<void> {
+  const bytes = await tr4kerDownloadBytes(hit.slug, apiKey);
+  await uploadTorrentData(bytes, transmissionPath('series'));
+  rememberKeys(
+    sub,
+    keys.map((k) => `${hit.slug}|${k.season}x${k.episode}`),
+  );
+  for (const k of keys) maybeAdvanceBase(sub, k.season, k.episode);
+}
+
+/** Rattrapage d'un épisode (fiche série) : cherche le meilleur torrent et l'envoie à Transmission. */
+export async function requestEpisode(
+  subId: string,
+  season: number,
+  episode: number,
+  apiKey: string,
+): Promise<string> {
+  const sub = loadSubscriptions().find((s) => s.id === subId);
+  if (!sub) throw new SeriesWatchError('Suivi introuvable (rafraîchis la liste).');
+  if (hasRetrievedEpisode(sub, season, episode)) {
+    throw new SeriesWatchError(`${fmtSE(season, episode)} déjà envoyé vers Transmission.`);
+  }
+  const hits = await searchHitsForTarget(sub.query, apiKey, season, episode);
+  const best = pickBestEpisode(hits, season, episode);
+  if (!best) throw new SeriesWatchError(`Aucun torrent pour ${sub.title} ${fmtSE(season, episode)}.`);
+  await ingestHit(sub, best, [{ season, episode }], apiKey);
+  sub.lastCheckAt = Date.now();
+  sub.lastResult = `Récupéré : ${fmtSE(season, episode)}`;
+  upsertSubscription(sub);
+  await notifyEpisode(sub.title, season, episode);
+  return `${sub.title} ${fmtSE(season, episode)} → Transmission`;
+}
+
+/** Rattrapage d'une saison : pack si possible, sinon chaque épisode déjà diffusé. */
+export async function requestSeason(
+  subId: string,
+  season: number,
+  episodes: number[],
+  apiKey: string,
+): Promise<string> {
+  const sub = loadSubscriptions().find((s) => s.id === subId);
+  if (!sub) throw new SeriesWatchError('Suivi introuvable (rafraîchis la liste).');
+  const wanted = [...new Set(episodes.filter((n) => n > 0))].sort((a, b) => a - b);
+  if (wanted.length === 0) throw new SeriesWatchError('Aucun épisode encore diffusé pour cette saison.');
+  const pending = wanted.filter((ep) => !hasRetrievedEpisode(sub, season, ep));
+  if (pending.length === 0) return `Saison ${season} déjà envoyée vers Transmission.`;
+  let hits = await searchHitsForTarget(sub.query, apiKey, season);
+  const pack = pickBestSeasonPack(hits, season);
+  if (pack) {
+    await ingestHit(
+      sub,
+      pack,
+      pending.map((episode) => ({ season, episode })),
+      apiKey,
+    );
+    sub.lastCheckAt = Date.now();
+    sub.lastResult = `Récupéré : saison ${season} (pack)`;
+    upsertSubscription(sub);
+    await notifyEpisode(sub.title, season, pending[pending.length - 1]);
+    return `${sub.title} saison ${season} (pack, ${pending.length} ép.) → Transmission`;
+  }
+  const missing: number[] = [];
+  for (const episode of pending) {
+    if (!pickBestEpisode(hits, season, episode)) missing.push(episode);
+  }
+  for (const episode of missing) {
+    const extra = await searchHitsForTarget(sub.query, apiKey, season, episode);
+    hits = mergeHits([hits, extra]);
+  }
+  let cur = sub;
+  let added = 0;
+  for (const episode of pending) {
+    if (hasRetrievedEpisode(cur, season, episode)) continue;
+    const best = pickBestEpisode(hits, season, episode);
+    if (!best) continue;
+    try {
+      await ingestHit(cur, best, [{ season, episode }], apiKey);
+      added += 1;
+      cur.lastCheckAt = Date.now();
+      cur.lastResult = `Récupéré : ${fmtSE(season, episode)}`;
+      upsertSubscription(cur);
+      cur = loadSubscriptions().find((s) => s.id === subId) ?? cur;
+    } catch {
+      /* on continue les autres épisodes */
+    }
+  }
+  if (added === 0) throw new SeriesWatchError(`Aucun torrent pour ${sub.title} saison ${season}.`);
+  const leftover = pending.length - added;
+  return leftover > 0
+    ? `${sub.title} saison ${season} : ${added} épisode(s) → Transmission (${leftover} introuvable(s))`
+    : `${sub.title} saison ${season} : ${added} épisode(s) → Transmission`;
 }
 
 /** Vrai si une vérification globale est due (throttle 6 h). */

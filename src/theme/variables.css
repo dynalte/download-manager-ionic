@@ -362,3 +362,32 @@ ion-input,
 ion-textarea {
   font-size: 16px;
 }
+
+/* ---------- Calendrier des sorties (onglet Suivis) ---------- */
+.cal-empty {
+  text-align: center;
+  padding: 28px 16px;
+}
+
+.cal-heading {
+  margin: 8px 16px 0;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--ion-color-medium);
+}
+
+ion-item.sub-focused {
+  --background: color-mix(in srgb, var(--ion-color-primary) 12%, transparent);
+}
+
+.season-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.season-head ion-button {
+  margin: 0;
+}

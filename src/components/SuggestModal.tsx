@@ -20,11 +20,11 @@ import {
   IonFooter,
   IonChip,
 } from '@ionic/react';
-import { refreshOutline, downloadOutline, filmOutline, eyeOffOutline, sparklesOutline, searchOutline } from 'ionicons/icons';
+import { refreshOutline, downloadOutline, filmOutline, eyeOffOutline, sparklesOutline, searchOutline, notificationsOutline } from 'ionicons/icons';
 import { useHistory } from 'react-router-dom';
 import { fetchLibrariesData, fetchWatchHistory, type PlexLibraryData } from '../services/plex';
 import { settings, transmissionPath } from '../services/settings';
-import { buildAllocineUrl } from '../services/torrentScripts';
+import { buildAllocineQuery, buildAllocineUrl } from '../services/torrentScripts';
 import { fetchGeminiRecommendations, fetchFollowUpIdeas, type GeminiRecommendation } from '../services/gemini';
 import { searchTorrents, downloadFilmTorrent, formatBytes, type DiscoveryFilm } from '../services/tr4kerDiscovery';
 import { uploadTorrentData } from '../services/transmission';
@@ -33,7 +33,48 @@ import { loadSeenSuggestions, seenKeyFor, seenKeys, type SeenSuggestion } from '
 import { buildOwnedIndex, isOwned } from '../services/aiSuggest';
 import { loadSeenMerged, markSeenEverywhere } from '../services/seenSync';
 import { requestBrowserOpen } from '../services/browserNavigation';
+import {
+  forgetDeletedSubscription,
+  loadSubscriptions,
+  subscriptionIdFor,
+  upsertSubscription,
+  type SeriesSubscription,
+} from '../services/seriesWatch';
+import { pushSubscription } from '../services/seriesSync';
+import { fetchPreviousEpisode, primeShowCache, searchShows, type ShowSearchHit } from '../services/seriesCalendar';
 import RatingStars from './RatingStars';
+
+function fmtWatchEpisode(season: number, episode: number): string {
+  return `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+}
+
+function alreadyFollowed(title: string, year?: string): boolean {
+  const id = subscriptionIdFor(title, year);
+  const n = title.trim().toLowerCase();
+  return loadSubscriptions().some((s) => s.id === id || s.title.trim().toLowerCase() === n);
+}
+
+function pickShowHit(hits: ShowSearchHit[], rec: GeminiRecommendation): ShowSearchHit | null {
+  if (hits.length === 0) return null;
+  const year = String(rec.year || '').trim();
+  const title = rec.title.trim().toLowerCase();
+  let best = hits[0];
+  let bestScore = -1;
+  for (const hit of hits) {
+    const n = hit.name.trim().toLowerCase();
+    let score = 0;
+    if (n === title) score += 100;
+    else if (n.startsWith(title) || title.startsWith(n)) score += 70;
+    else if (n.includes(title) || title.includes(n)) score += 40;
+    else score += 10;
+    if (year && hit.year === year) score += 25;
+    if (score > bestScore) {
+      bestScore = score;
+      best = hit;
+    }
+  }
+  return best;
+}
 
 type SuggestWant = 'all' | 'movies' | 'series';
 
@@ -45,7 +86,7 @@ interface Props {
 /**
  * Modale Suggestions IA (Gemini) partagée entre les onglets Plex et Catalogue :
  * recommandations absentes de la librairie Plex, pistes de suivi, liens
- * Allociné / téléchargement TR4KER → Transmission, marquage « déjà vu ».
+ * Allociné / téléchargement TR4KER → Transmission, ajout aux suivis, marquage « déjà vu ».
  */
 const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const history = useHistory();
@@ -73,6 +114,10 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [dlError, setDlError] = useState<Record<number, string>>({});
   const [sendingSlug, setSendingSlug] = useState<string | null>(null);
   const [dlMsg, setDlMsg] = useState('');
+  /** Ajout aux suivis depuis une suggestion série (index de la reco). */
+  const [watchAdding, setWatchAdding] = useState<number | null>(null);
+  const [watchAdded, setWatchAdded] = useState<Record<number, string>>({});
+  const [watchError, setWatchError] = useState<Record<number, string>>({});
 
   useEffect(() => {
     if (isOpen) setSuggestError('');
@@ -85,6 +130,9 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
       return;
     }
     setSuggestLoading(true);
+    setWatchAdding(null);
+    setWatchAdded({});
+    setWatchError({});
     setSuggestError('');
     setDlResults({});
     setDlError({});
@@ -285,6 +333,66 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
     }
   }
 
+  /** Abonne une suggestion série : TVMaze pour la base, puis suivi local + synchro. */
+  async function followSuggestion(rec: GeminiRecommendation, index: number) {
+    if (watchAdding !== null) return;
+    if (alreadyFollowed(rec.title, rec.year) || watchAdded[index]) {
+      setWatchAdded((prev) => ({ ...prev, [index]: prev[index] || 'déjà suivie' }));
+      setDlMsg(`${rec.title} est déjà dans tes suivis.`);
+      return;
+    }
+    setWatchAdding(index);
+    setWatchError((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+    try {
+      let hits = await searchShows(rec.title);
+      if (hits.length === 0 && rec.year) hits = await searchShows(`${rec.title} ${rec.year}`);
+      const hit = pickShowHit(hits, rec);
+      if (!hit) {
+        throw new Error(`Série introuvable sur TVMaze : ${rec.title}`);
+      }
+      const id = subscriptionIdFor(hit.name, hit.year);
+      if (loadSubscriptions().some((s) => s.id === id)) {
+        setWatchAdded((prev) => ({ ...prev, [index]: 'déjà suivie' }));
+        setDlMsg(`${hit.name} est déjà dans tes suivis.`);
+        return;
+      }
+      const prev = await fetchPreviousEpisode(hit.id);
+      const maxS = prev?.season ?? 0;
+      const maxE = prev?.episode ?? 0;
+      const query = buildAllocineQuery(hit.name) || hit.name;
+      const base = maxS > 0 ? fmtWatchEpisode(maxS, maxE) : 'aucun épisode';
+      const sub: SeriesSubscription = {
+        id,
+        title: hit.name,
+        query,
+        year: hit.year,
+        enabled: true,
+        lastSeason: maxS,
+        lastEpisode: maxE,
+        addedKeys: [],
+        createdAt: Date.now(),
+        lastCheckAt: 0,
+        lastResult: `Base TVMaze : ${base}`,
+        updatedAt: Date.now(),
+      };
+      forgetDeletedSubscription(sub.id);
+      upsertSubscription(sub);
+      void pushSubscription(sub);
+      primeShowCache(sub.id, hit);
+      setWatchAdded((prev) => ({ ...prev, [index]: base }));
+      setDlMsg(`Suivi activé : ${hit.name} (base ${base}). Voir l’onglet Suivis.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setWatchError((prev) => ({ ...prev, [index]: msg }));
+    } finally {
+      setWatchAdding(null);
+    }
+  }
+
   /** Télécharge le .torrent puis l'envoie vers Transmission (dossier films/séries). */
   async function sendSuggestionTorrent(film: DiscoveryFilm, rec: GeminiRecommendation) {
     if (sendingSlug) return;
@@ -464,6 +572,22 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
                       <IonIcon icon={downloadOutline} slot="start" />
                       {dlResults[i] !== undefined ? 'Masquer' : 'Télécharger'}
                     </IonButton>
+                    {rec.type !== 'movie' && (
+                      <IonButton
+                        size="small"
+                        fill="outline"
+                        color="tertiary"
+                        disabled={watchAdding !== null || !!watchAdded[i] || alreadyFollowed(rec.title, rec.year)}
+                        onClick={() => void followSuggestion(rec, i)}
+                      >
+                        <IonIcon icon={notificationsOutline} slot="start" />
+                        {watchAdding === i
+                          ? 'Ajout…'
+                          : watchAdded[i] || alreadyFollowed(rec.title, rec.year)
+                            ? 'Suivie'
+                            : 'Suivre'}
+                      </IonButton>
+                    )}
                     <IonButton
                       size="small"
                       fill="clear"
@@ -482,6 +606,11 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
                   {!!dlError[i] && (
                     <p style={{ whiteSpace: 'normal' }}>
                       <IonText color="danger">{dlError[i]}</IonText>
+                    </p>
+                  )}
+                  {!!watchError[i] && (
+                    <p style={{ whiteSpace: 'normal' }}>
+                      <IonText color="danger">{watchError[i]}</IonText>
                     </p>
                   )}
                   {dlResults[i] !== undefined && (

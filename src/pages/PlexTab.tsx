@@ -683,6 +683,12 @@ const PlexTab: React.FC = () => {
                   <IonIcon icon={playOutline} slot="start" />
                   Lire sur Plex
                 </IonButton>
+                {detail && detail.type.toLowerCase() === 'show' && (
+                  <IonButton expand="block" fill="outline" onClick={() => void subscribeShow(detail)}>
+                    <IonIcon icon={notificationsOutline} slot="start" />
+                    Suivre la série
+                  </IonButton>
+                )}
                 <IonButton
                   expand="block"
                   fill="outline"
@@ -697,12 +703,6 @@ const PlexTab: React.FC = () => {
                   <IonIcon icon={filmOutline} slot="start" />
                   Voir sur Allociné
                 </IonButton>
-                {detail && detail.type.toLowerCase() === 'show' && (
-                  <IonButton expand="block" fill="outline" onClick={() => void subscribeShow(detail)}>
-                    <IonIcon icon={notificationsOutline} slot="start" />
-                    Suivre la série
-                  </IonButton>
-                )}
                 <IonButton
                   expand="block"
                   fill="outline"

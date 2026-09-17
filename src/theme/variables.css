@@ -334,10 +334,17 @@ html.ion-palette-dark .rs-one-fg {
   font-size: 1.05rem;
 }
 
+/* Web : la toolbar Ionic reste à 56px et masque la 2e rangée (Suivre / Supprimer). */
+ion-modal.detail-modal ion-footer ion-toolbar {
+  --min-height: auto;
+  height: auto;
+}
+
 .detail-actions {
   display: grid;
   grid-template-columns: 1fr;
   gap: 8px;
+  width: 100%;
   padding: 6px 10px 4px;
 }
 

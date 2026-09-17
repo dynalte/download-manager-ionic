@@ -22,6 +22,8 @@ import {
   IonSegment,
   IonSegmentButton,
   IonSearchbar,
+  IonFab,
+  IonFabButton,
   RefresherEventDetail,
 } from '@ionic/react';
 import {
@@ -455,15 +457,18 @@ const SeriesWatchTab: React.FC = () => {
     <IonPage>
       <IonHeader>
         <IonToolbar>
+          <IonButtons slot="start">
+            <IonButton onClick={openAddModal} aria-label="Ajouter une série">
+              <IonIcon icon={addOutline} slot="start" />
+              Ajouter
+            </IonButton>
+          </IonButtons>
           <IonTitle>Suivis</IonTitle>
           <IonButtons slot="end">
-            <IonButton onClick={openAddModal} title="Ajouter une série">
-              <IonIcon icon={addOutline} />
-            </IonButton>
-            <IonButton onClick={() => setShowSettings(true)}>
+            <IonButton onClick={() => setShowSettings(true)} aria-label="Réglages">
               <IonIcon icon={settingsOutline} />
             </IonButton>
-            <IonButton onClick={() => void runCheckAll()} disabled={checking || !hasKey}>
+            <IonButton onClick={() => void runCheckAll()} disabled={checking || !hasKey} aria-label="Vérifier">
               <IonIcon icon={refreshOutline} />
             </IonButton>
           </IonButtons>
@@ -481,6 +486,11 @@ const SeriesWatchTab: React.FC = () => {
         <IonRefresher slot="fixed" onIonRefresh={handleRefresh}>
           <IonRefresherContent />
         </IonRefresher>
+        <IonFab slot="fixed" vertical="bottom" horizontal="end">
+          <IonFabButton onClick={openAddModal} title="Ajouter une série">
+            <IonIcon icon={addOutline} />
+          </IonFabButton>
+        </IonFab>
 
         {!hasKey && (
           <div style={{ padding: '12px 16px' }}>

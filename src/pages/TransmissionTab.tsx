@@ -24,12 +24,12 @@ import {
   IonToast,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, trashOutline, sparklesOutline, mailOutline } from 'ionicons/icons';
-import { fetchDownloads, removeTorrent, type TransmissionDownloadItem } from '../services/transmission';
+import { settingsOutline, refreshOutline, trashOutline, sparklesOutline, mailOutline, folderOutline } from 'ionicons/icons';
+import { fetchDownloads, removeTorrent, setTorrentLocation, type TransmissionDownloadItem } from '../services/transmission';
 import { BOOK_RECIPIENTS, isBookDownload, sendBookByEmail, type BookRecipient } from '../services/bookShare';
 import { fetchLinkRecords, normalizedTitleForMatching, type PlexLinkRecord } from '../services/plex';
 import { refreshLibraries } from '../services/plex';
-import { settings, folderDisplayName, folderForDownloadDir, type DestinationFolder } from '../services/settings';
+import { settings, DESTINATION_FOLDERS, folderDisplayName, folderForDownloadDir, transmissionPath, type DestinationFolder } from '../services/settings';
 import { ingestDownloads, requestAuthorizationIfNeeded } from '../services/completionMonitor';
 import { appLog } from '../services/debugLog';
 import { wipeRemoteFiles, fetchDiskSpace, type DiskSpace } from '../services/serverApi';
@@ -185,6 +185,8 @@ const TransmissionTab: React.FC = () => {
   const [mailTarget, setMailTarget] = useState<TransmissionDownloadItem | null>(null);
   const [mailBusy, setMailBusy] = useState(false);
   const [mailToast, setMailToast] = useState('');
+  const [moveTarget, setMoveTarget] = useState<TransmissionDownloadItem | null>(null);
+  const [moveBusy, setMoveBusy] = useState(false);
   const [refreshingPlex, setRefreshingPlex] = useState(false);
   const [plexStatus, setPlexStatus] = useState('Plex inactif');
   const [showSettings, setShowSettings] = useState(false);
@@ -367,6 +369,27 @@ const TransmissionTab: React.FC = () => {
     }
   }
 
+  /** Déplace les données d'un téléchargement vers Films / Séries / Musique / Livres. */
+  async function handleMove(item: TransmissionDownloadItem, folder: DestinationFolder) {
+    setMoveTarget(null);
+    if (moveBusy) return;
+    setMoveBusy(true);
+    try {
+      const location = transmissionPath(folder);
+      appLog('info', 'transmission', `déplacement id=${item.id} « ${item.name.slice(0, 80)} » vers ${location}…`);
+      await setTorrentLocation(item.id, location, true);
+      setMailToast(`Déplacé vers ${folderDisplayName[folder]}`);
+      await refreshDownloads();
+      appLog('info', 'transmission', `déplacement id=${item.id} confirmé par le daemon`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      appLog('error', 'transmission', `déplacement id=${item.id} échoué : ${msg}`);
+      setError(`Erreur déplacement: ${msg}`);
+    } finally {
+      setMoveBusy(false);
+    }
+  }
+
   return (
     <IonPage>
       <IonHeader>
@@ -441,6 +464,9 @@ const TransmissionTab: React.FC = () => {
                 <IonButton fill="clear" color="danger" slot="start" onClick={() => setPendingDeletion(d)}>
                   <IonIcon icon={trashOutline} />
                 </IonButton>
+                <IonButton fill="clear" slot="start" onClick={() => setMoveTarget(d)} disabled={moveBusy}>
+                  <IonIcon icon={folderOutline} />
+                </IonButton>
                 {(d.isFinished || d.percentDone >= 1.0) && isBookDownload(d.downloadDir) && (
                   <IonButton fill="clear" slot="start" onClick={() => setMailTarget(d)} disabled={mailBusy}>
                     <IonIcon icon={mailOutline} />
@@ -483,6 +509,25 @@ const TransmissionTab: React.FC = () => {
         </p>
 
         <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+        <IonActionSheet
+          isOpen={moveTarget !== null}
+          onDidDismiss={() => setMoveTarget(null)}
+          header={`Déplacer « ${moveTarget?.name ?? ''} » vers…`}
+          subHeader={moveTarget?.downloadDir ? `Actuel : ${moveTarget.downloadDir}` : undefined}
+          buttons={[
+            ...DESTINATION_FOLDERS.map((folder) => {
+              const path = transmissionPath(folder);
+              const isCurrent = moveTarget ? folderForDownloadDir(moveTarget.downloadDir) === folder : false;
+              return {
+                text: `${isCurrent ? '✓ ' : ''}${folderDisplayName[folder]} — ${path}`,
+                handler: () => {
+                  if (moveTarget) void handleMove(moveTarget, folder);
+                },
+              };
+            }),
+            { text: 'Annuler', role: 'cancel' },
+          ]}
+        />
         <IonActionSheet
           isOpen={mailTarget !== null}
           onDidDismiss={() => setMailTarget(null)}

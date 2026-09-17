@@ -344,6 +344,24 @@ export async function removeTorrent(id: number, deleteLocalData = true): Promise
   );
 }
 
+/** Déplace un torrent vers un autre dossier (download-dir). Port RPC `torrent-set-location`. */
+export async function setTorrentLocation(id: number, location: string, move = true): Promise<void> {
+  const dir = location.trim().replace(/\/+$/, '');
+  if (!dir) throw new TorrentUploadError('Dossier de destination vide.');
+  const payload = {
+    method: 'torrent-set-location',
+    tag: 5,
+    arguments: { ids: [id], location: dir, move },
+  };
+  if (isElectron()) {
+    await electronRpc<unknown>(payload);
+    return;
+  }
+  await withSession<unknown>(async (sessionID) =>
+    rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
+  );
+}
+
 /** Télécharge un .torrent via l'URL (avec cookies du WebView impossible en iframe cross-origin :
  *  on fait un fetch direct, avec Referer de la page). Port de downloadTorrent(). */
 export async function downloadTorrentBytes(url: string, referer?: string): Promise<{ bytes: Uint8Array; filename: string }> {

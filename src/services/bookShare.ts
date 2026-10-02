@@ -1,6 +1,6 @@
 /**
  * Envoi d'e-books (dossier "livres") par e-mail : liseuses Kindle de
- * Stéphanie / Anaïs + adresse de test de Nicolas.
+ * Stéphanie / Anaïs / Timéa + adresse de test de Nicolas.
  *
  * Chaîne : fichier rapatrié depuis le serveur HTTP (port 8080, Basic Auth)
  * -> écrit dans le cache -> composeur Mail natif (cordova-plugin-email,
@@ -25,6 +25,7 @@ export interface BookRecipient {
 export const BOOK_RECIPIENTS: BookRecipient[] = [
   { id: 'stephanie', name: 'Stéphanie (Kindle)', email: 'steph.royer_48@kindle.com' },
   { id: 'anais', name: 'Anaïs (Kindle)', email: 'royer91.a_ekjnju@kindle.com' },
+  { id: 'timea', name: 'Timéa (Kindle)', email: 'royer.timea_gbdHFl@kindle.com' },
   { id: 'nicolas', name: 'Nicolas (test)', email: 'royer.nicolas@gmail.com' },
 ];
 

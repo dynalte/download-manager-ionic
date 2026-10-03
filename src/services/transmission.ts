@@ -313,6 +313,40 @@ export async function fetchDownloads(): Promise<TransmissionDownloadItem[]> {
   }));
 }
 
+/** Fichier interne d'un torrent (chemin relatif au download-dir, inclut le dossier racine). */
+export interface TorrentFile {
+  /** Ex: "Mon.Livre-DUP/file.epub" ou "Mon.Livre.epub" (single-file). */
+  name: string;
+  length: number;
+  bytesCompleted: number;
+}
+
+/**
+ * Liste les fichiers d'un torrent (torrent-get ids + files).
+ * Sert aux torrents multi-fichiers (ex: e-books) : on choisit le .epub à envoyer.
+ */
+export async function fetchTorrentFiles(id: number): Promise<TorrentFile[]> {
+  const payload = {
+    method: 'torrent-get',
+    tag: 6,
+    arguments: { ids: [id], fields: ['files'] },
+  };
+  const args = isElectron()
+    ? await electronRpc<{ torrents?: Array<{ files?: TorrentFile[] }> }>(payload)
+    : await withSession<{ torrents?: Array<{ files?: TorrentFile[] }> }>(async (sessionID) =>
+        rpcPost(baseRequest(sessionID), JSON.stringify(payload)),
+      );
+  const files = args.torrents?.[0]?.files;
+  if (!Array.isArray(files)) return [];
+  return files
+    .filter((f) => f && typeof f.name === 'string' && f.name.trim() !== '')
+    .map((f) => ({
+      name: f.name,
+      length: typeof f.length === 'number' ? f.length : 0,
+      bytesCompleted: typeof f.bytesCompleted === 'number' ? f.bytesCompleted : 0,
+    }));
+}
+
 /** Espace libre du dossier de téléchargement (octets, `session-stats`). */
 export interface SessionStats {
   downloadDirFreeSpace: number;

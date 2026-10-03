@@ -25,8 +25,8 @@ import {
   RefresherEventDetail,
 } from '@ionic/react';
 import { settingsOutline, refreshOutline, trashOutline, sparklesOutline, mailOutline, folderOutline } from 'ionicons/icons';
-import { fetchDownloads, removeTorrent, setTorrentLocation, type TransmissionDownloadItem } from '../services/transmission';
-import { BOOK_RECIPIENTS, isBookDownload, sendBookByEmail, type BookRecipient } from '../services/bookShare';
+import { fetchDownloads, fetchTorrentFiles, removeTorrent, setTorrentLocation, type TransmissionDownloadItem } from '../services/transmission';
+import { BOOK_RECIPIENTS, filterEbookFiles, isBookDownload, isSingleEbookFile, sendBookByEmail, type BookRecipient } from '../services/bookShare';
 import { fetchLinkRecords, normalizedTitleForMatching, type PlexLinkRecord } from '../services/plex';
 import { refreshLibraries } from '../services/plex';
 import { settings, DESTINATION_FOLDERS, folderDisplayName, folderForDownloadDir, transmissionPath, type DestinationFolder } from '../services/settings';
@@ -183,6 +183,8 @@ const TransmissionTab: React.FC = () => {
   const [error, setError] = useState('');
   const [pendingDeletion, setPendingDeletion] = useState<TransmissionDownloadItem | null>(null);
   const [mailTarget, setMailTarget] = useState<TransmissionDownloadItem | null>(null);
+  const [mailInnerFile, setMailInnerFile] = useState<string | null>(null);
+  const [mailFilePick, setMailFilePick] = useState<{ item: TransmissionDownloadItem; files: string[] } | null>(null);
   const [mailBusy, setMailBusy] = useState(false);
   const [mailToast, setMailToast] = useState('');
   const [moveTarget, setMoveTarget] = useState<TransmissionDownloadItem | null>(null);
@@ -359,11 +361,45 @@ const TransmissionTab: React.FC = () => {
     if (mailBusy) return;
     setMailBusy(true);
     try {
-      const outcome = await sendBookByEmail(item, recipient);
+      const outcome = await sendBookByEmail(item, recipient, { innerFile: mailInnerFile ?? undefined });
       if (outcome === 'sent') setMailToast(`E-mail envoyé à ${recipient.name}`);
       else if (outcome === 'shared') setMailToast('Fichier prêt : choisis Mail pour l’envoyer');
     } catch (e) {
       setError(`Erreur envoi e-mail: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setMailBusy(false);
+      setMailInnerFile(null);
+    }
+  }
+
+  /**
+   * Clic enveloppe : single-file (.epub/.pdf/...) -> choix destinataire direct.
+   * Dossier (multi-fichiers) -> liste via Transmission + choix du fichier, puis destinataire.
+   */
+  async function handleMailClick(item: TransmissionDownloadItem) {
+    if (mailBusy) return;
+    setError('');
+    if (isSingleEbookFile(item.name)) {
+      setMailInnerFile(null);
+      setMailTarget(item);
+      return;
+    }
+    setMailBusy(true);
+    try {
+      const files = await fetchTorrentFiles(item.id);
+      const ebooks = filterEbookFiles(files.map((f) => f.name));
+      if (ebooks.length === 0) {
+        setError(`Aucun .epub/.pdf dans « ${item.name} » (torrent multi-fichiers sans e-book ?).`);
+        return;
+      }
+      if (ebooks.length === 1) {
+        setMailInnerFile(ebooks[0]);
+        setMailTarget(item);
+        return;
+      }
+      setMailFilePick({ item, files: ebooks });
+    } catch (e) {
+      setError(`Liste des fichiers impossible: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setMailBusy(false);
     }
@@ -468,7 +504,7 @@ const TransmissionTab: React.FC = () => {
                   <IonIcon icon={folderOutline} />
                 </IonButton>
                 {(d.isFinished || d.percentDone >= 1.0) && isBookDownload(d.downloadDir) && (
-                  <IonButton fill="clear" slot="start" onClick={() => setMailTarget(d)} disabled={mailBusy}>
+                  <IonButton fill="clear" slot="start" onClick={() => void handleMailClick(d)} disabled={mailBusy}>
                     <IonIcon icon={mailOutline} />
                   </IonButton>
                 )}
@@ -529,9 +565,39 @@ const TransmissionTab: React.FC = () => {
           ]}
         />
         <IonActionSheet
+          isOpen={mailFilePick !== null}
+          onDidDismiss={() => setMailFilePick(null)}
+          header={`Choisir le fichier dans « ${mailFilePick?.item.name ?? ''} »`}
+          subHeader="Torrent multi-fichiers : seul le .epub/.pdf choisi sera envoyé"
+          buttons={[
+            ...(mailFilePick?.files ?? []).map((f) => {
+              const short = f.length > 80 ? `…${f.slice(-79)}` : f;
+              return {
+                text: short,
+                handler: () => {
+                  if (mailFilePick) {
+                    setMailInnerFile(f);
+                    setMailTarget(mailFilePick.item);
+                    setMailFilePick(null);
+                  }
+                },
+              };
+            }),
+            {
+              text: 'Annuler',
+              role: 'cancel',
+              handler: () => setMailFilePick(null),
+            },
+          ]}
+        />
+        <IonActionSheet
           isOpen={mailTarget !== null}
-          onDidDismiss={() => setMailTarget(null)}
-          header={`Envoyer « ${mailTarget?.name ?? ''} » par e-mail`}
+          onDidDismiss={() => {
+            setMailTarget(null);
+            setMailInnerFile(null);
+          }}
+          header={`Envoyer « ${mailInnerFile ? mailInnerFile.split('/').pop() : mailTarget?.name ?? ''} » par e-mail`}
+          subHeader={mailInnerFile ? `Dossier : ${mailTarget?.name ?? ''}` : undefined}
           buttons={[
             ...BOOK_RECIPIENTS.map((r) => ({
               text: `${r.name} <${r.email}>`,
@@ -539,7 +605,14 @@ const TransmissionTab: React.FC = () => {
                 if (mailTarget) void handleSendBook(mailTarget, r);
               },
             })),
-            { text: 'Annuler', role: 'cancel' },
+            {
+              text: 'Annuler',
+              role: 'cancel',
+              handler: () => {
+                setMailTarget(null);
+                setMailInnerFile(null);
+              },
+            },
           ]}
         />
         <IonToast isOpen={!!mailToast} message={mailToast} duration={3000} onDidDismiss={() => setMailToast('')} />

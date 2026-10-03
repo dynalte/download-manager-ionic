@@ -7,6 +7,10 @@
  * destinataire + pièce jointe) avec repli feuille de partage iOS.
  * Hors natif : téléchargement navigateur + mailto pré-rempli (sans PJ).
  *
+ * Multi-fichiers : si le torrent est un dossier, le fichier interne est
+ * choisi via fetchTorrentFiles (transmission.ts) puis téléchargé sous
+ * <base>/livres/<Dossier>/<fichier> (même racine que le single-file).
+ *
  * Note : le serveur de fichiers n'envoie pas de headers CORS, donc le
  * fetch WebView est bloqué ("Load failed"). En natif on passe par
  * CapacitorHttp (requête URLSession, non soumise à la SOP).
@@ -33,6 +37,29 @@ export type BookSendResult = 'sent' | 'cancelled' | 'shared';
 
 export class BookShareError extends Error {}
 
+/** Extensions envoyables vers Kindle (Send-to-Kindle : epub, pdf, mobi, azw...). */
+export const BOOK_EBOOK_EXTENSIONS = ['.epub', '.pdf', '.mobi', '.azw', '.azw3', '.kfx', '.txt'] as const;
+
+/** Vrai si le chemin se termine par une extension d'e-book envoyable. */
+export function isEbookFileName(path: string): boolean {
+  const lower = path.trim().toLowerCase();
+  return BOOK_EBOOK_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Vrai si le nom du torrent est déjà un fichier envoyable en direct
+ * (single-file). Sinon c'est un dossier -> torrent multi-fichiers : il faut
+ * choisir un fichier interne via fetchTorrentFiles + isEbookFileName.
+ */
+export function isSingleEbookFile(torrentName: string): boolean {
+  return isEbookFileName(torrentName);
+}
+
+/** Ne garde que les fichiers internes envoyables, triés par nom. */
+export function filterEbookFiles(names: string[]): string[] {
+  return names.filter(isEbookFileName).sort((a, b) => a.localeCompare(b));
+}
+
 /** Vrai si le téléchargement vient du dossier livres (bouton d'envoi affiché). */
 export function isBookDownload(downloadDir: string): boolean {
   try {
@@ -49,6 +76,22 @@ const DOWNLOADS_PREFIX = '/downloads';
  * (le serveur HTTP expose l'arborescence sous /downloads).
  */
 export function buildFileServerURL(downloadDir: string, name: string): string | null {
+  return buildFileServerURLForRelativePath(downloadDir, name.trim());
+}
+
+/**
+ * Construit l'URL d'un chemin relatif au download-dir Transmission.
+ * - single-file : relativePath = nom du torrent ("Mon Livre.epub").
+ * - multi-fichiers : relativePath = chemin interne Transmission
+ *   ("Mon.Dossier/file.epub", inclut en général le dossier racine). Si le
+ *   chemin inclut déjà le nom du torrent on l'utilise tel quel, sinon on le
+ *   préfixe (vieilles versions / cas limites).
+ */
+export function buildFileServerURLForRelativePath(
+  downloadDir: string,
+  relativePath: string,
+  torrentName?: string,
+): string | null {
   const base = settings.fileServerBaseURL;
   if (!base) return null;
   const dir = downloadDir.trim().replace(/\/+$/, '');
@@ -56,8 +99,14 @@ export function buildFileServerURL(downloadDir: string, name: string): string | 
   if (dir === DOWNLOADS_PREFIX) rel = '/';
   else if (dir.startsWith(`${DOWNLOADS_PREFIX}/`)) rel = dir.slice(DOWNLOADS_PREFIX.length);
   else return null;
-  if (!name.trim()) return null;
-  const segs = `${rel}/${name.trim()}`
+  const relPath = relativePath.trim().replace(/^\/+/, '');
+  if (!relPath) return null;
+  const tName = (torrentName ?? '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
+  let full = `${rel}/${relPath}`;
+  if (tName !== '' && !relPath.startsWith(`${tName}/`) && relPath !== tName) {
+    full = `${rel}/${tName}/${relPath}`;
+  }
+  const segs = full
     .split('/')
     .filter((s) => s && s !== '.' && s !== '..')
     .map((s) => encodeURIComponent(s));
@@ -88,8 +137,18 @@ function checkBookBytes(buf: Uint8Array, contentType: string): void {
   }
 }
 
-function checkBookStatus(status: number): void {
-  if (status === 401 || status === 403) {
+function checkBookStatus(status: number, targetLabel?: string): void {
+  if (status === 401) {
+    throw new BookShareError('Serveur de fichiers : accès refusé (identifiants dans Réglages).');
+  }
+  if (status === 403) {
+    // Apache interdit le listage des dossiers : un 403 sur une cible sans
+    // extension d'e-book = torrent multi-fichiers (on a visé le dossier).
+    if (targetLabel && !isEbookFileName(targetLabel)) {
+      throw new BookShareError(
+        'Cible invalide : c’est un dossier, pas un fichier (torrent multi-fichiers). Choisis un .epub/.pdf à l’intérieur.',
+      );
+    }
     throw new BookShareError('Serveur de fichiers : accès refusé (identifiants dans Réglages).');
   }
   if (status === 404) {
@@ -101,7 +160,7 @@ function checkBookStatus(status: number): void {
 }
 
 /** Requête native (pas de CORS) : les binaires arrivent en base64. */
-async function downloadBookBytesNative(url: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+async function downloadBookBytesNative(url: string, targetLabel?: string): Promise<{ bytes: Uint8Array; contentType: string }> {
   let res;
   try {
     res = await CapacitorHttp.get({
@@ -114,7 +173,7 @@ async function downloadBookBytesNative(url: string): Promise<{ bytes: Uint8Array
   } catch (e) {
     throw new BookShareError(`Serveur de fichiers injoignable (${e instanceof Error ? e.message : String(e)}).`);
   }
-  checkBookStatus(res.status);
+  checkBookStatus(res.status, targetLabel);
   const contentType =
     (Object.entries(res.headers ?? {}).find(([k]) => k.toLowerCase() === 'content-type')?.[1] as string) ?? '';
   const bytes = typeof res.data === 'string' ? base64ToBytes(res.data) : new Uint8Array(res.data ?? []);
@@ -122,10 +181,10 @@ async function downloadBookBytesNative(url: string): Promise<{ bytes: Uint8Array
   return { bytes, contentType };
 }
 
-async function downloadBookBytes(url: string): Promise<{ bytes: Uint8Array; contentType: string }> {
-  if (Capacitor.isNativePlatform()) return downloadBookBytesNative(url);
+async function downloadBookBytes(url: string, targetLabel?: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+  if (Capacitor.isNativePlatform()) return downloadBookBytesNative(url, targetLabel);
   const res = await fetch(url, { headers: basicAuthHeader() });
-  checkBookStatus(res.status);
+  checkBookStatus(res.status, targetLabel);
   const contentType = res.headers.get('content-type') ?? '';
   const buf = new Uint8Array(await res.arrayBuffer());
   checkBookBytes(buf, contentType);
@@ -228,17 +287,34 @@ export function toEmailAttachmentPath(uri: string): string {
  * Envoie le fichier d'un téléchargement terminé par e-mail au destinataire.
  * Natif : composeur Mail (PJ) ou feuille de partage en repli.
  * Web/exe : téléchargement navigateur + mailto pré-rempli (sans PJ possible).
+ *
+ * Multi-fichiers : si le torrent est un dossier, passe `innerFile` = chemin
+ * interne Transmission (ex: "Mon.Dossier/file.epub", cf. fetchTorrentFiles).
+ * Sans innerFile et avec un nom de dossier -> erreur explicite (pas de 403
+ * "accès refusé" trompeur).
  */
 export async function sendBookByEmail(
   item: { name: string; downloadDir: string },
   recipient: BookRecipient,
+  opts?: { innerFile?: string },
 ): Promise<BookSendResult> {
-  const url = buildFileServerURL(item.downloadDir, item.name);
+  const inner = opts?.innerFile?.trim() ?? '';
+  if (!inner && !isSingleEbookFile(item.name)) {
+    throw new BookShareError(
+      'Cible invalide : c’est un dossier, pas un fichier (torrent multi-fichiers). Choisis un .epub/.pdf à l’intérieur.',
+    );
+  }
+  const targetLabel = inner !== '' ? inner : item.name;
+  const url = inner !== ''
+    ? buildFileServerURLForRelativePath(item.downloadDir, inner, item.name)
+    : buildFileServerURL(item.downloadDir, item.name);
   if (!url) {
     throw new BookShareError('Dossier hors de l’arborescence du serveur de fichiers (/downloads).');
   }
-  const { bytes } = await downloadBookBytes(url);
-  const filename = sanitizeFileName(item.name);
+  const { bytes } = await downloadBookBytes(url, targetLabel);
+  // Nom de PJ = nom du fichier réel (pas du dossier racine).
+  const filename = sanitizeFileName(targetLabel.split('/').pop() ?? item.name);
+  const displayName = filename;
 
   if (!Capacitor.isNativePlatform()) {
     // Web/exe : pas de composeur natif -> on télécharge le fichier et on
@@ -255,7 +331,7 @@ export async function sendBookByEmail(
     } finally {
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 20000);
     }
-    const mailto = `mailto:${encodeURIComponent(recipient.email)}?subject=${encodeURIComponent(`[Livre] ${item.name}`)}&body=${encodeURIComponent(`Ci-joint : ${item.name} (fichier téléchargé à part, à joindre).`)}`;
+    const mailto = `mailto:${encodeURIComponent(recipient.email)}?subject=${encodeURIComponent(`[Livre] ${displayName}`)}&body=${encodeURIComponent(`Ci-joint : ${displayName} (fichier téléchargé à part, à joindre).`)}`;
     window.location.href = mailto;
     return 'shared';
   }
@@ -279,8 +355,8 @@ export async function sendBookByEmail(
         email.open(
           {
             to: [recipient.email],
-            subject: `[Livre] ${item.name}`,
-            body: `Envoi depuis Download Manager : ${item.name}`,
+            subject: `[Livre] ${displayName}`,
+            body: `Envoi depuis Download Manager : ${displayName}`,
             isHtml: false,
             // Chemin décodé : voir toEmailAttachmentPath (espaces/accents).
             attachments: [toEmailAttachmentPath(uri)],
@@ -303,7 +379,7 @@ export async function sendBookByEmail(
   // Repli : feuille de partage iOS (choisir Mail, adresse à saisir).
   try {
     await Share.share({
-      title: item.name,
+      title: displayName,
       text: `Pour ${recipient.name} (${recipient.email})`,
       files: [uri],
     });

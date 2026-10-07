@@ -51,6 +51,7 @@ import {
   type SeriesSubscription,
 } from '../services/seriesWatch';
 import { settings } from '../services/settings';
+import { activeSourceKeys } from '../services/c411';
 import { isServerConfigured } from '../services/serverApi';
 import { appLog } from '../services/debugLog';
 import {
@@ -249,15 +250,15 @@ const SeriesWatchTab: React.FC = () => {
   }, [subs, detailSub?.id]);
 
   async function runCheckAll(silent = false) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey) {
-      if (!silent) setToast('Colle ta clé API TR4KER dans Réglages pour activer le suivi');
+    const keys = activeSourceKeys();
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
+      if (!silent) setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
       return;
     }
     if (checking) return;
     setChecking(true);
     try {
-      const results = await checkAllSubscriptions(apiKey);
+      const results = await checkAllSubscriptions(keys);
       const added = results.reduce((n, r) => n + r.added.length, 0);
       const errors = results.filter((r) => r.error);
       if (!silent || added > 0 || errors.length > 0) {
@@ -277,16 +278,16 @@ const SeriesWatchTab: React.FC = () => {
   }
 
   async function runCheckOne(sub: SeriesSubscription) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey) {
-      setToast('Colle ta clé API TR4KER dans Réglages pour activer le suivi');
+    const keys = activeSourceKeys();
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
+      setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
       return;
     }
     if (checking) return;
     setCheckingId(sub.id);
     try {
       const live = loadSubscriptions().find((s) => s.id === sub.id) ?? sub;
-      const r = await checkSubscription({ ...live, addedKeys: [...live.addedKeys] }, apiKey);
+      const r = await checkSubscription({ ...live, addedKeys: [...live.addedKeys] }, keys);
       setToast(r.added.length > 0 ? `${r.added.length} nouvel(s) épisode(s) vers Transmission` : 'Rien de nouveau');
     } catch (e) {
       setToast(e instanceof Error ? e.message : String(e));
@@ -297,14 +298,14 @@ const SeriesWatchTab: React.FC = () => {
   }
 
   async function forceOne(c: InspectCandidate) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey || !inspecting || c.season === null || c.episode === null) return;
+    const keys = activeSourceKeys();
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !inspecting || c.season === null || c.episode === null) return;
     setForcingSlug(c.slug);
     try {
       const msg = await forceDownloadCandidate(
         inspecting.id,
-        { slug: c.slug, name: c.name, season: c.season, episode: c.episode },
-        apiKey,
+        { slug: c.slug, name: c.name, season: c.season, episode: c.episode, source: c.source, downloadUrl: c.downloadUrl },
+        keys,
       );
       setToast(msg);
       const updated = loadSubscriptions().find((s) => s.id === inspecting.id);
@@ -419,9 +420,9 @@ const SeriesWatchTab: React.FC = () => {
   }
 
   async function openInspect(sub: SeriesSubscription) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey) {
-      setToast('Colle ta clé API TR4KER dans Réglages pour activer le suivi');
+    const keys = activeSourceKeys();
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
+      setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
       return;
     }
     setInspecting(sub);
@@ -430,7 +431,7 @@ const SeriesWatchTab: React.FC = () => {
     setInspectLoading(true);
     try {
       const live = loadSubscriptions().find((s) => s.id === sub.id) ?? sub;
-      const res = await inspectSubscription({ ...live, addedKeys: [...live.addedKeys] }, apiKey);
+      const res = await inspectSubscription({ ...live, addedKeys: [...live.addedKeys] }, keys);
       setInspectRes(res);
       // Miroir console Xcode (via pont natif) : pratique en debug device.
       appLog('info', 'inspect', `${sub.title} | query="${res.query}" base=${res.base} | ${res.candidates.length} candidat(s)`);
@@ -451,7 +452,7 @@ const SeriesWatchTab: React.FC = () => {
     }
   }
 
-  const hasKey = settings.tr4kerApiKey !== '';
+  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '';
 
   return (
     <IonPage>
@@ -496,7 +497,7 @@ const SeriesWatchTab: React.FC = () => {
           <div style={{ padding: '12px 16px' }}>
             <IonText color="medium">
               <small>
-                Colle ta clé API TR4KER (réglages du compte TR4KER) dans Réglages pour activer la détection auto.
+                Colle ta clé API TR4KER ou C411 dans Réglages pour activer la détection auto.
               </small>
             </IonText>
           </div>
@@ -710,7 +711,7 @@ const SeriesWatchTab: React.FC = () => {
                   </IonText>
                   {inspectRes.candidates.length === 0 ? (
                     <p>
-                      <IonText color="warning">TR4KER ne renvoie rien pour cette requête (titre non indexé ou recherche trop large).</IonText>
+                      <IonText color="warning">Aucun résultat (TR4KER/C411) pour cette requête (titre non indexé ou recherche trop large).</IonText>
                     </p>
                   ) : (
                     <IonList>
@@ -726,6 +727,7 @@ const SeriesWatchTab: React.FC = () => {
                                 {c.season !== null ? `S${String(c.season).padStart(2, '0')}E${String(c.episode ?? 0).padStart(2, '0')}` : 'sans S/E'}
                               </IonBadge>{' '}
                               {c.isPack && <IonBadge color="tertiary">pack</IonBadge>}{' '}
+                              {c.source === 'c411' && <IonBadge color="secondary">C411</IonBadge>}{' '}
                               {!!c.quality && <IonBadge color="secondary">{c.quality}</IonBadge>}
                             </p>
                             <p style={{ whiteSpace: 'normal' }}>
@@ -774,9 +776,10 @@ const SeriesWatchTab: React.FC = () => {
 /** Vérification silencieuse au lancement (si clé + throttle 6 h dépassé). */
 export async function runLaunchCheck(): Promise<void> {
   try {
-    if (!settings.tr4kerApiKey || !isGlobalCheckDue()) return;
+    const keys = activeSourceKeys();
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !isGlobalCheckDue()) return;
     if (loadSubscriptions().every((s) => !s.enabled)) return;
-    await checkAllSubscriptions(settings.tr4kerApiKey);
+    await checkAllSubscriptions(keys);
     void pushAllSubscriptions();
   } catch {
     /* silencieux */

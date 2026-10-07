@@ -42,6 +42,13 @@
         app_config : clé → valeur + updated_at). Volontairement exclus :
         seen_sync_url (l'app connaît déjà l'URL qu'elle appelle) et
         seen_sync_token (c'est le secret d'auth lui-même).
+      Proxy C411 (le client ne joint pas toujours c411.org : DNS filtré,
+      AdGuard/VPN, CORS du navigateur dev, maintenance vue côté client) :
+      POST ?action=c411_search {apikey, t?, q?, cat?, limit?, season?, ep?, imdbid?, tmdbid?}
+                                               → {ok:true, status, xml} (Torznab brut)
+      POST ?action=c411_download {url, apikey?} → {ok:true, status, data_base64}
+        Cage stricte : https://c411.org uniquement (anti proxy ouvert).
+        La clé C411 transite par requête (jamais stockée côté serveur).
 */
 declare(strict_types=1);
 
@@ -397,8 +404,13 @@ const CONFIG_KEYS = [
     'file_server_username',
     'file_server_password',
     'tr4ker_api_key',
+    'c411_api_key',
+    'tr4ker_enabled',
+    'c411_enabled',
+    'c411_proxy_mode',
     'gemini_api_key',
     'gemini_model',
+    'tmdb_api_key',
     'plex_use_cloud',
     'plex_base_url',
     'plex_token',
@@ -455,4 +467,101 @@ if ($action === 'config_set') {
     out(['ok' => true, 'saved' => $saved]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set).', 400);
+// ---------- Proxy C411 (recherche + téléchargement .torrent) ----------
+
+/**
+ * GET distant sortant (recherche XML comme .torrent binaire).
+ * Retourne [status HTTP, corps]. Binaire-safe (pas de conversion).
+ */
+function c411_fetch(string $url, int $timeout = 25): array
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_USERAGENT => 'DownloadManager-PHP-Proxy/1.0',
+            CURLOPT_HTTPHEADER => ['Accept: application/rss+xml,application/xml,text/xml,*/*'],
+        ]);
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = (string) curl_error($ch);
+        curl_close($ch);
+        if ($body === false) {
+            fail('Proxy C411 : ' . ($err !== '' ? $err : 'échec requête') . '.', 502);
+        }
+        return [$status > 0 ? $status : 502, (string) $body];
+    }
+    // Repli sans curl (allow_url_fopen requis).
+    $ctx = stream_context_create(['http' => [
+        'timeout' => $timeout,
+        'header' => 'User-Agent: DownloadManager-PHP-Proxy/1.0',
+        'ignore_errors' => true,
+    ]]);
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) {
+        fail('Proxy C411 : requête impossible (curl absent ?).', 502);
+    }
+    $status = 0;
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $h, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    return [$status > 0 ? $status : 200, (string) $body];
+}
+
+if ($action === 'c411_search') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey === '') {
+        fail('Clé API C411 manquante.', 400);
+    }
+    $t = (string) ($input['t'] ?? 'search');
+    if (!in_array($t, ['search', 'caps', 'tv-search', 'movie-search', 'music-search', 'book-search'], true)) {
+        fail('Type Torznab invalide.', 400);
+    }
+    $params = ['apikey' => $apikey, 't' => $t];
+    foreach (['q', 'cat', 'limit', 'season', 'ep', 'imdbid', 'tmdbid'] as $k) {
+        $v = trim((string) ($input[$k] ?? ''));
+        if ($v !== '') {
+            $params[$k] = $v;
+        }
+    }
+    if (isset($params['limit'])) {
+        $params['limit'] = (string) min(100, max(1, (int) $params['limit']));
+    }
+    [$status, $body] = c411_fetch('https://c411.org/api/torznab?' . http_build_query($params));
+    out(['ok' => true, 'status' => $status, 'xml' => $body]);
+}
+
+if ($action === 'c411_download') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $url = trim((string) ($input['url'] ?? ''));
+    // Cage anti proxy ouvert : sorties https://c411.org uniquement.
+    $parts = parse_url($url);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || strtolower((string) ($parts['host'] ?? '')) !== 'c411.org') {
+        fail('URL non autorisée (https://c411.org uniquement).', 403);
+    }
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey !== '' && !preg_match('/[?&]apikey=/i', $url)) {
+        $url .= (str_contains($url, '?') ? '&' : '?') . 'apikey=' . urlencode($apikey);
+    }
+    [$status, $body] = c411_fetch($url, 60);
+    if ($status < 200 || $status >= 300 || $body === '') {
+        out(['ok' => true, 'status' => $status, 'data_base64' => '']);
+    }
+    out(['ok' => true, 'status' => $status, 'data_base64' => base64_encode($body)]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download).', 400);

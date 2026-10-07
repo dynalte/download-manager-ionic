@@ -24,6 +24,7 @@ import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { loadShowDetail, type ShowDetail, type ShowDetailSeason } from '../services/seriesCalendar';
 import { settings } from '../services/settings';
+import { activeSourceKeys } from '../services/c411';
 import {
   hasRetrievedEpisode,
   requestEpisode,
@@ -80,7 +81,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
   const [ratings, setRatings] = useState<AllocineRatings | null>(null);
   const [ratingsLoading, setRatingsLoading] = useState(false);
 
-  const hasKey = settings.tr4kerApiKey !== '';
+  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '';
 
   useEffect(() => {
     if (!isOpen || !sub) {
@@ -123,12 +124,12 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
   }, [isOpen, sub?.id]);
 
   async function retrieveEpisode(season: number, episode: number) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey || !sub || busyKey) return;
+    const keys = activeSourceKeys();
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !sub || busyKey) return;
     const key = `s${season}e${episode}`;
     setBusyKey(key);
     try {
-      const msg = await requestEpisode(sub.id, season, episode, apiKey);
+      const msg = await requestEpisode(sub.id, season, episode, keys);
       onToast(msg);
       onChanged();
     } catch (e) {
@@ -139,12 +140,12 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
   }
 
   async function retrieveSeason(season: ShowDetailSeason) {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey || !sub || busyKey) return;
+    const keys = activeSourceKeys();
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !sub || busyKey) return;
     setBusyKey(`s${season.season}`);
     try {
       const aired = season.episodes.filter((ep) => ep.aired).map((ep) => ep.episode);
-      const msg = await requestSeason(sub.id, season.season, aired, apiKey);
+      const msg = await requestSeason(sub.id, season.season, aired, keys);
       onToast(msg);
       onChanged();
     } catch (e) {
@@ -241,7 +242,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
             {!hasKey && (
               <p>
                 <IonText color="warning">
-                  <small>Colle ta clé API TR4KER dans Réglages pour récupérer des épisodes.</small>
+                  <small>Colle ta clé API TR4KER ou C411 dans Réglages pour récupérer des épisodes.</small>
                 </IonText>
               </p>
             )}

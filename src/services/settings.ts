@@ -20,6 +20,10 @@ export const Keys = {
   fileServerUsername: 'file_server_username',
   fileServerPassword: 'file_server_password',
   tr4kerApiKey: 'tr4ker_api_key',
+  c411ApiKey: 'c411_api_key',
+  tr4kerEnabled: 'tr4ker_enabled',
+  c411Enabled: 'c411_enabled',
+  c411ProxyMode: 'c411_proxy_mode',
   downloadNotificationsEnabled: 'download_notifications_enabled',
   downloadPollIntervalSeconds: 'download_poll_interval_seconds',
   plexMediaFilter: 'plex_media_filter',
@@ -27,6 +31,7 @@ export const Keys = {
   plexDisplayMode: 'plex_display_mode',
   geminiApiKey: 'gemini_api_key',
   geminiModel: 'gemini_model',
+  tmdbApiKey: 'tmdb_api_key',
   seenSyncURL: 'seen_sync_url',
   seenSyncToken: 'seen_sync_token',
 } as const;
@@ -62,6 +67,9 @@ function getInt(key: string, fallback: number): number {
 }
 
 export type DestinationFolder = 'films' | 'series' | 'musique' | 'livres';
+
+/** Mode d'accès au tracker C411 (direct, proxy PHP, ou auto avec secours). */
+export type C411ProxyMode = 'auto' | 'direct' | 'proxy';
 
 export const DESTINATION_FOLDERS: DestinationFolder[] = ['films', 'series', 'musique', 'livres'];
 
@@ -164,9 +172,31 @@ export const settings = {
     const stored = getString(Keys.tr4kerApiKey, '').trim();
     return stored === '' ? AppConfig.tr4kerApiKey : stored;
   },
+  /** Clé API C411 (profil c411.org). Vide = recherche C411 désactivée. */
+  get c411ApiKey(): string {
+    const stored = getString(Keys.c411ApiKey, '').trim();
+    return stored === '' ? AppConfig.c411ApiKey : stored;
+  },
+  /** Source TR4KER active pour les recherches (défaut : oui). */
+  get tr4kerEnabled(): boolean {
+    return getBool(Keys.tr4kerEnabled, true);
+  },
+  /** Source C411 active pour les recherches (défaut : oui). */
+  get c411Enabled(): boolean {
+    return getBool(Keys.c411Enabled, true);
+  },
+  /** Mode d'accès C411 : proxy (défaut, via serveur PHP), direct, auto (direct + proxy en secours). */
+  get c411ProxyMode(): C411ProxyMode {
+    const v = getString(Keys.c411ProxyMode, 'proxy').trim();
+    return v === 'direct' || v === 'auto' ? v : 'proxy';
+  },
   /** Clé API Google AI Studio pour les suggestions Gemini. Vide = désactivé. */
   get geminiApiKey(): string {
     return getString(Keys.geminiApiKey, '').trim();
+  },
+  /** Clé API TMDB (affiches du Catalogue). Vide = pas de repli affiches. */
+  get tmdbApiKey(): string {
+    return getString(Keys.tmdbApiKey, '').trim();
   },
   get geminiModel(): string {
     const stored = getString(Keys.geminiModel, '').trim();

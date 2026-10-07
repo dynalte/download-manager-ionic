@@ -12,6 +12,7 @@ export const AppConfig = {
   fileServerUsername: 'vr',
   fileServerPassword: 'lavrcestbien',
   tr4kerApiKey: '',
+  c411ApiKey: '',
 } as const;
 
 export const TR4KER_URL = 'https://tr4ker.net/';

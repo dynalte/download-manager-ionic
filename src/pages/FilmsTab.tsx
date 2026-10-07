@@ -29,7 +29,6 @@ import { settingsOutline, refreshOutline, downloadOutline, filmOutline, starOutl
 import { useHistory } from 'react-router-dom';
 import {
   fetchFilms,
-  downloadFilmTorrent,
   fetchTorrentDetail,
   fetchSameMovieTorrents,
   loadAddedSlugs,
@@ -43,10 +42,12 @@ import {
   type DiscoveryCategoryKey,
   type FilmsPeriod,
 } from '../services/tr4kerDiscovery';
+import { activeSourceKeys, downloadFromSource, fetchLatestC411, searchAllSources } from '../services/c411';
 import { settings } from '../services/settings';
 import { transmissionPath } from '../services/settings';
 import { uploadTorrentData } from '../services/transmission';
 import { fetchAllocineRatings, formatAllocineNote, type AllocineRatings } from '../services/allocine';
+import { fetchTmdbPoster } from '../services/tmdb';
 import { buildAllocineUrl } from '../services/torrentScripts';
 import { fetchSearchIdeas } from '../services/gemini';
 import { requestBrowserOpen } from '../services/browserNavigation';
@@ -55,6 +56,47 @@ import SuggestModal from '../components/SuggestModal';
 import RatingStars from '../components/RatingStars';
 
 const PAGE_SIZE = 25;
+
+/** Période Nouveautés -> seuil pubDate pour les dernières sorties C411 (0 = tout). */
+function periodSinceMs(p: FilmsPeriod): number {
+  const day = 24 * 3600 * 1000;
+  if (p === 'day') return Date.now() - day;
+  if (p === 'week') return Date.now() - 7 * day;
+  if (p === 'month') return Date.now() - 31 * day;
+  return 0;
+}
+
+/**
+ * Visuel d'un résultat : notes/synopsis/affiche Allociné, avec repli affiche
+ * TMDB quand Allociné ne renvoie rien (anti-bot / CORS). Les notes Allociné
+ * existantes sont conservées, seule l'affiche manquante est complétée.
+ */
+async function fetchArtwork(film: DiscoveryFilm, cat: DiscoveryCategoryKey): Promise<AllocineRatings | null> {
+  let r: AllocineRatings | null = null;
+  try {
+    r = await fetchAllocineRatings(film.title, film.year);
+  } catch {
+    r = null;
+  }
+  if ((r?.posterURL ?? null) || !settings.tmdbApiKey) return r;
+  try {
+    const p = await fetchTmdbPoster(settings.tmdbApiKey, film.title, film.year, cat === 'series' ? 'tv' : 'movie');
+    if (!p?.posterURL) return r;
+    return {
+      title: r?.title ?? film.title,
+      year: r?.year ?? film.year ?? '',
+      url: r?.url ?? '',
+      press: r?.press ?? null,
+      pressReviews: r?.pressReviews ?? null,
+      spectators: r?.spectators ?? null,
+      votes: r?.votes ?? null,
+      posterURL: p.posterURL,
+      synopsis: r?.synopsis ?? null,
+    };
+  } catch {
+    return r;
+  }
+}
 
 const FilmsTab: React.FC = () => {
   const history = useHistory();
@@ -94,25 +136,70 @@ const FilmsTab: React.FC = () => {
   const [ideas, setIdeas] = useState<string[]>([]);
   const [ideasLoading, setIdeasLoading] = useState(false);
   const [ideasError, setIdeasError] = useState('');
+  /** Total C411 du chargement Nouveautés (non paginé : conservé pour « Charger plus » TR4KER). */
+  const c411ExtraTotal = useRef(0);
 
-  const hasKey = settings.tr4kerApiKey !== '';
+  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '';
+  /** Libellé des sources actives pour la recherche ("TR4KER", "C411" ou "TR4KER + C411"). */
+  const searchSourcesLabel = (() => {
+    const keys = activeSourceKeys();
+    return [keys.tr4kerApiKey !== '' ? 'TR4KER' : '', keys.c411ApiKey !== '' ? 'C411' : ''].filter(Boolean).join(' + ');
+  })();
 
   const loadItems = useCallback(async (cat: DiscoveryCategoryKey, p: FilmsPeriod, q: string, pageNum: number, append: boolean) => {
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey) {
-      setError('Colle ta clé API TR4KER dans Réglages pour voir les films.');
+    const keys = activeSourceKeys();
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
+      setError('Colle ta clé API TR4KER ou C411 dans Réglages pour voir les films.');
       return;
     }
     if (append) setLoadingMore(true);
     else setLoading(true);
     try {
       const def = discoveryCategory(cat);
-      const res = await fetchFilms(apiKey, { cat: def.cat, period: p, query: q, limit: PAGE_SIZE, page: pageNum, sort: 'seeders' });
-      const items = filterByDiscoveryCategory(res.films, cat);
-      setFilms((prev) => (append ? [...prev, ...items.filter((f) => !prev.some((x) => x.slug === f.slug))] : items));
-      setTotal(res.total);
+      // Recherche par titre : TR4KER + C411 fusionnés (tri seeders).
+      if (q.trim() !== '') {
+        const res = await searchAllSources(q, keys, { category: cat, limit: PAGE_SIZE });
+        const items = filterByDiscoveryCategory(res.films, cat);
+        setFilms(items);
+        setTotal(items.length);
+        setPage(1);
+        setError('');
+        if (res.partialErrors.length > 0) setToast(res.partialErrors.join(' / '));
+        return;
+      }
+      // Sans recherche : Nouveautés TR4KER (période, paginé) + dernières
+      // sorties C411 (rechargées à chaque filtre, pas à « Charger plus »).
+      const partial: string[] = [];
+      let tr4kerFilms: DiscoveryFilm[] = [];
+      let tr4kerTotal = 0;
+      if (keys.tr4kerApiKey) {
+        try {
+          const res = await fetchFilms(keys.tr4kerApiKey, { cat: def.cat, period: p, query: q, limit: PAGE_SIZE, page: pageNum, sort: 'seeders' });
+          tr4kerFilms = res.films;
+          tr4kerTotal = res.total;
+        } catch (e) {
+          partial.push(e instanceof Error ? e.message : String(e));
+        }
+      }
+      let c411Count = append ? c411ExtraTotal.current : 0;
+      let c411Films: DiscoveryFilm[] = [];
+      if (!append && keys.c411ApiKey) {
+        try {
+          c411Films = await fetchLatestC411(keys.c411ApiKey, { category: cat, limit: 100, sinceMs: periodSinceMs(p) });
+          c411Count = c411Films.length;
+          c411ExtraTotal.current = c411Count;
+        } catch (e) {
+          partial.push(e instanceof Error ? e.message : String(e));
+        }
+      }
+      const merged = filterByDiscoveryCategory([...tr4kerFilms, ...c411Films], cat);
+      merged.sort((a, b) => b.seeders - a.seeders);
+      if (merged.length === 0 && partial.length > 0) throw new Error(partial.join(' / '));
+      setFilms((prev) => (append ? [...prev, ...merged.filter((f) => !prev.some((x) => x.slug === f.slug))] : merged));
+      setTotal(tr4kerTotal + c411Count);
       setPage(pageNum);
       setError('');
+      if (partial.length > 0) setToast(partial.join(' / '));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -156,7 +243,8 @@ const FilmsTab: React.FC = () => {
     setQuery(v);
   }
 
-  // Notes Allociné en arrière-plan (films + séries uniquement).
+  // Notes Allociné en arrière-plan (films + séries uniquement), avec repli
+  // affiche TMDB quand Allociné est bloqué (anti-bot / CORS).
   useEffect(() => {
     if (!category.allocine) return;
     const reqId = ++ratingsFillReq.current;
@@ -170,7 +258,7 @@ const FilmsTab: React.FC = () => {
       while (active < CONCURRENCY && cursor < pending.length) {
         const film = pending[cursor++];
         active += 1;
-        void fetchAllocineRatings(film.title, film.year)
+        void fetchArtwork(film, categoryKey)
           .then((r) => {
             if (r && ratingsFillReq.current === reqId) {
               ratingsMapRef.current = { ...ratingsMapRef.current, [film.slug]: r };
@@ -186,17 +274,21 @@ const FilmsTab: React.FC = () => {
     };
     const stagger = window.setTimeout(pump, 600);
     return () => window.clearTimeout(stagger);
-  }, [films, category.allocine]);
+  }, [films, category.allocine, categoryKey]);
 
   async function handleRefresh(event: CustomEvent<RefresherEventDetail>) {
     await loadItems(categoryKey, period, query, 1, false);
     event.detail.complete();
   }
 
-  /** Ouvre la fiche + charge le descriptif TR4KER (toujours affiché). */
+  /** Ouvre la fiche + charge le descriptif (TR4KER uniquement ; C411 n'en expose pas). */
   function openDetail(film: DiscoveryFilm) {
     setDetail(film);
     setDetailDesc(undefined);
+    if (film.source !== 'tr4ker') {
+      setDetailDesc(null);
+      return;
+    }
     const apiKey = settings.tr4kerApiKey;
     if (!apiKey) {
       setDetailDesc(null);
@@ -207,11 +299,15 @@ const FilmsTab: React.FC = () => {
       .catch(() => setDetailDesc(null));
   }
 
-  /** Ouvre la liste des autres formats du film affiché. */
+  /** Ouvre la liste des autres formats du film affiché (TR4KER uniquement). */
   async function openFormats(film: DiscoveryFilm) {
     setShowFormats(true);
     setFormats([]);
     setFormatsError('');
+    if (film.source !== 'tr4ker') {
+      setFormatsError('Autres formats : TR4KER uniquement (résultat C411).');
+      return;
+    }
     const apiKey = settings.tr4kerApiKey;
     if (!apiKey) {
       setFormatsError('Clé API TR4KER manquante (Réglages).');
@@ -227,17 +323,17 @@ const FilmsTab: React.FC = () => {
     }
   }
 
-  /** Envoie le .torrent vers Transmission (dossier de la catégorie). */
+  /** Envoie le .torrent vers Transmission (dossier de la catégorie), quelle que soit la source. */
   async function sendToDownload(film: DiscoveryFilm) {
     if (addingSlug) return;
-    const apiKey = settings.tr4kerApiKey;
-    if (!apiKey) {
-      setToast('Clé API TR4KER manquante (Réglages).');
+    const keys = activeSourceKeys();
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
+      setToast('Clé API TR4KER ou C411 manquante (Réglages).');
       return;
     }
     setAddingSlug(film.slug);
     try {
-      const bytes = await downloadFilmTorrent(film.slug, apiKey);
+      const bytes = await downloadFromSource(film, keys);
       const folder = discoveryCategory(categoryKey).folder;
       const res = await uploadTorrentData(bytes, transmissionPath(folder));
       const name = res.added?.name ?? res.duplicate?.name ?? film.title;
@@ -338,7 +434,7 @@ const FilmsTab: React.FC = () => {
           <p>
             <IonText color="medium">
               <small>
-                {query ? `Recherche "${query}"` : 'Nouveautés'} {category.label.toLowerCase()} triés par popularité (seeders)
+                {query ? `Recherche "${query}" (${searchSourcesLabel})` : `Nouveautés (${searchSourcesLabel})`} {category.label.toLowerCase()} triés par popularité (seeders)
                 {total > 0 ? ` • ${films.length}/${total}` : ''}
               </small>
             </IonText>
@@ -415,6 +511,7 @@ const FilmsTab: React.FC = () => {
                   {category.allocine && <FilmRating film={film} />}
                   <p>
                     {film.isFreeleech && <IonBadge color="tertiary">Freeleech</IonBadge>}{' '}
+                    {film.source === 'c411' && <IonBadge color="secondary">C411</IonBadge>}{' '}
                     {addedSlugs.has(film.slug) && <IonBadge color="success">Ajouté</IonBadge>}
                   </p>
                 </IonLabel>
@@ -455,6 +552,7 @@ const FilmsTab: React.FC = () => {
                     </h2>
                     <p>
                       {detail.isFreeleech && <IonBadge color="tertiary">Freeleech</IonBadge>}{' '}
+                      {detail.source === 'c411' && <IonBadge color="secondary">C411</IonBadge>}{' '}
                       {addedSlugs.has(detail.slug) && <IonBadge color="success">Ajouté</IonBadge>}
                     </p>
                     <div className="detail-meta">
@@ -514,12 +612,16 @@ const FilmsTab: React.FC = () => {
                       </div>
                     );
                   })()}
-                <h3>Descriptif TR4KER</h3>
-                <IonText color="medium">
-                  <p className="detail-summary">
-                    {detailDesc ?? (detailDesc === undefined ? 'Chargement…' : 'Aucun descriptif.')}
-                  </p>
-                </IonText>
+                {detail.source === 'tr4ker' && (
+                  <>
+                    <h3>Descriptif TR4KER</h3>
+                    <IonText color="medium">
+                      <p className="detail-summary">
+                        {detailDesc ?? (detailDesc === undefined ? 'Chargement…' : 'Aucun descriptif.')}
+                      </p>
+                    </IonText>
+                  </>
+                )}
                 <h3>Torrent</h3>
                 <IonText color="medium">
                   <p className="detail-summary">{detail.name}</p>
@@ -548,7 +650,7 @@ const FilmsTab: React.FC = () => {
                     Voir sur Allociné
                   </IonButton>
                 )}
-                {categoryKey === 'films' && (
+                {categoryKey === 'films' && detail?.source === 'tr4ker' && (
                   <IonButton expand="block" fill="outline" disabled={!detail} onClick={() => detail && void openFormats(detail)}>
                     <IonIcon icon={downloadOutline} slot="start" />
                     Autres formats

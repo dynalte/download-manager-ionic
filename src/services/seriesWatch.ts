@@ -1,11 +1,13 @@
 /**
  * Suivi de séries : abonnement -> détection des nouveaux épisodes sur
- * TR4KER -> ajout automatique vers Transmission -> notification locale.
+ * TR4KER et/ou C411 (selon clés + interrupteurs, Réglages) -> ajout
+ * automatique vers Transmission -> notification locale.
  *
- * Source : API TR4KER publique documentée (`X-Api-Key` personnelle,
- * générable dans les réglages du compte TR4KER, à coller dans Réglages).
- * Recherche : GET /api/torrents?q=<titre>&limit=25&search_in=title
- * Fichier : GET /api/torrents/<slug>/download (même clé).
+ * Sources : API TR4KER (`X-Api-Key` personnelle, réglages du compte TR4KER)
+ *   recherche GET /api/torrents?q=<titre>&limit=25&search_in=title,
+ *   fichier GET /api/torrents/<slug>/download (même clé) ;
+ *   API Torznab C411 (clé du profil c411.org)
+ *   GET /api/torznab?apikey=<CLE>&t=search&q=...&cat=5000 (voir c411.ts).
  *
  * Vérification : au lancement + retour au premier plan (throttle 6 h) +
  * bouton manuel. iOS ne permet pas de cron en tâche de fond.
@@ -14,6 +16,7 @@ import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { settings } from './settings';
 import { transmissionPath } from './settings';
+import { downloadC411Torrent, searchC411, type SourceKeys } from './c411';
 import { uploadTorrentData } from './transmission';
 import { requestAuthorizationIfNeeded } from './completionMonitor';
 
@@ -50,6 +53,9 @@ export interface EpisodeCandidate {
   slug: string;
   /** Label qualité (ex : « 1080p • HEVC • WEB-DL »). */
   quality: string;
+  source: 'tr4ker' | 'c411';
+  /** URL du .torrent (source C411 : enclosure Torznab). */
+  downloadUrl?: string;
 }
 
 export interface CheckResult {
@@ -243,6 +249,9 @@ export interface SearchHit {
   slug: string;
   name: string;
   seeders: number;
+  source: 'tr4ker' | 'c411';
+  /** URL du .torrent (source C411 : enclosure Torznab). */
+  downloadUrl?: string;
 }
 
 function normalizeSearchItem(raw: unknown): SearchHit | null {
@@ -251,7 +260,7 @@ function normalizeSearchItem(raw: unknown): SearchHit | null {
   const name = String(r.name ?? r.title ?? r.kept_name ?? r.label ?? '').trim();
   if (!slug || !name) return null;
   const seeds = parseInt(String(r.seeders ?? r.seeds ?? '0'), 10);
-  return { slug, name, seeders: Number.isFinite(seeds) && seeds > 0 ? seeds : 0 };
+  return { slug, name, seeders: Number.isFinite(seeds) && seeds > 0 ? seeds : 0, source: 'tr4ker' };
 }
 
 async function tr4kerSearchRaw(
@@ -387,6 +396,49 @@ async function tr4kerRefined(
   return [];
 }
 
+/** Recherche C411 (Torznab, catégorie séries) -> SearchHit. */
+async function c411WatchSearch(query: string, apiKey: string): Promise<SearchHit[]> {
+  const films = await searchC411(apiKey, query, { category: 'series', limit: 100 });
+  return films.map((f) => ({
+    slug: f.slug,
+    name: f.name,
+    seeders: f.seeders,
+    source: 'c411' as const,
+    downloadUrl: f.downloadUrl,
+  }));
+}
+
+/**
+ * Recherche multi-source du suivi : TR4KER (avec replis resserrés) et/ou
+ * C411 selon les clés actives. L'échec d'une source n'annule pas l'autre ;
+ * tout échec total lève l'erreur de la première source en défaut.
+ */
+async function watchSearch(query: string, keys: SourceKeys, sub?: SeriesSubscription): Promise<SearchHit[]> {
+  const lists: SearchHit[][] = [];
+  let firstErr: unknown = null;
+  if (keys.tr4kerApiKey.trim()) {
+    try {
+      lists.push(await tr4kerSearch(query, keys.tr4kerApiKey, sub));
+    } catch (e) {
+      firstErr = e;
+    }
+  }
+  if (keys.c411ApiKey.trim()) {
+    try {
+      lists.push(await c411WatchSearch(query, keys.c411ApiKey));
+    } catch (e) {
+      if (!firstErr) firstErr = e;
+    }
+  }
+  if (lists.length === 0) {
+    if (firstErr) throw firstErr;
+    throw new SeriesWatchError('Aucune source active (TR4KER/C411 : clés et interrupteurs, Réglages).');
+  }
+  const agg = new Map<string, SearchHit>();
+  for (const items of lists) for (const it of items) agg.set(it.slug, it);
+  return [...agg.values()];
+}
+
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64.replace(/\s/g, ''));
   const out = new Uint8Array(bin.length);
@@ -416,6 +468,12 @@ async function tr4kerDownloadBytes(slug: string, apiKey: string): Promise<Uint8A
   return bytes;
 }
 
+/** Télécharge le .torrent d'un candidat quelle que soit sa source. */
+async function watchDownloadBytes(hit: Pick<SearchHit, 'source' | 'downloadUrl' | 'slug'>, keys: SourceKeys): Promise<Uint8Array> {
+  if (hit.source === 'c411') return downloadC411Torrent(hit, keys.c411ApiKey);
+  return tr4kerDownloadBytes(hit.slug, keys.tr4kerApiKey);
+}
+
 // ---------- Vérification ----------
 
 async function notifyEpisode(title: string, season: number, episode: number): Promise<void> {
@@ -438,8 +496,8 @@ async function notifyEpisode(title: string, season: number, episode: number): Pr
 }
 
 /** Vérifie un abonnement : détecte, ajoute à Transmission, notifie. */
-export async function checkSubscription(sub: SeriesSubscription, apiKey: string): Promise<CheckResult> {
-  const items = await tr4kerSearch(sub.query, apiKey, sub);
+export async function checkSubscription(sub: SeriesSubscription, keys: SourceKeys): Promise<CheckResult> {
+  const items = await watchSearch(sub.query, keys, sub);
   const seen = new Set(sub.addedKeys);
   const fresh: Array<EpisodeCandidate & { score: number }> = [];
   let packsSkipped = 0;
@@ -456,7 +514,7 @@ export async function checkSubscription(sub: SeriesSubscription, apiKey: string)
       packsSkipped += 1;
       continue;
     }
-    fresh.push({ season: se.season, episode: se.episode, name: item.name, slug: item.slug, quality: qualityLabel(item.name), score: qualityScore(item.name, item.seeders) });
+    fresh.push({ season: se.season, episode: se.episode, name: item.name, slug: item.slug, quality: qualityLabel(item.name), source: item.source, downloadUrl: item.downloadUrl, score: qualityScore(item.name, item.seeders) });
   }
   // Un torrent par épisode : le meilleur score (1080p, HEVC, seeders), ordre croissant.
   const best = new Map<string, EpisodeCandidate & { score: number }>();
@@ -469,7 +527,7 @@ export async function checkSubscription(sub: SeriesSubscription, apiKey: string)
   const added: EpisodeCandidate[] = [];
   for (const cand of ordered) {
     const epKey = `${cand.season}x${cand.episode}`;
-    const bytes = await tr4kerDownloadBytes(cand.slug, apiKey);
+    const bytes = await watchDownloadBytes(cand, keys);
     await uploadTorrentData(bytes, transmissionPath('series'));
     const key = `${cand.slug}|${epKey}`;
     sub.addedKeys.push(key);
@@ -492,12 +550,12 @@ export async function checkSubscription(sub: SeriesSubscription, apiKey: string)
   return { subId: sub.id, added };
 }
 
-/** Vérifie tous les abonnements actifs (clé API requise). */
-export async function checkAllSubscriptions(apiKey: string): Promise<CheckResult[]> {
+/** Vérifie tous les abonnements actifs (au moins une clé requise). */
+export async function checkAllSubscriptions(keys: SourceKeys): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   for (const sub of loadSubscriptions().filter((s) => s.enabled)) {
     try {
-      results.push(await checkSubscription({ ...sub, addedKeys: [...sub.addedKeys] }, apiKey));
+      results.push(await checkSubscription({ ...sub, addedKeys: [...sub.addedKeys] }, keys));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const cur = loadSubscriptions().find((s) => s.id === sub.id);
@@ -520,6 +578,9 @@ export async function checkAllSubscriptions(apiKey: string): Promise<CheckResult
 export interface InspectCandidate {
   name: string;
   slug: string;
+  source: 'tr4ker' | 'c411';
+  /** URL du .torrent (source C411, pour le téléchargement forcé). */
+  downloadUrl?: string;
   matchesQuery: boolean;
   season: number | null;
   episode: number | null;
@@ -533,15 +594,15 @@ export interface InspectCandidate {
 }
 
 /**
- * Recherche à blanc (aucun téléchargement) : renvoie chaque candidat TR4KER
- * avec le motif de sa prise en compte ou de son rejet. Sert au diagnostic
- * (« nouvel épisode non détecté », « faux positif ajouté »).
+ * Recherche à blanc (aucun téléchargement) : renvoie chaque candidat
+ * (TR4KER et/ou C411) avec le motif de sa prise en compte ou de son rejet.
+ * Sert au diagnostic (« nouvel épisode non détecté », « faux positif ajouté »).
  */
 export async function inspectSubscription(
   sub: SeriesSubscription,
-  apiKey: string,
+  keys: SourceKeys,
 ): Promise<{ query: string; base: string; candidates: InspectCandidate[] }> {
-  const items = await tr4kerSearch(sub.query, apiKey, sub);
+  const items = await watchSearch(sub.query, keys, sub);
   const seen = new Set(sub.addedKeys);
   const out: InspectCandidate[] = [];
   for (const item of items) {
@@ -569,6 +630,8 @@ export async function inspectSubscription(
     out.push({
       name: item.name,
       slug: item.slug,
+      source: item.source,
+      downloadUrl: item.downloadUrl,
       matchesQuery,
       season: se?.season ?? null,
       episode: se?.episode ?? null,
@@ -598,8 +661,8 @@ export async function inspectSubscription(
  */
 export async function forceDownloadCandidate(
   subId: string,
-  cand: { slug: string; name: string; season: number; episode: number },
-  apiKey: string,
+  cand: { slug: string; name: string; season: number; episode: number; source?: 'tr4ker' | 'c411'; downloadUrl?: string },
+  keys: SourceKeys,
 ): Promise<string> {
   const sub = loadSubscriptions().find((s) => s.id === subId);
   if (!sub) throw new SeriesWatchError('Suivi introuvable (rafraîchis la liste).');
@@ -607,7 +670,8 @@ export async function forceDownloadCandidate(
   if (sub.addedKeys.includes(key) || sub.addedKeys.includes(cand.slug)) {
     throw new SeriesWatchError('Déjà traité (anti-doublon).');
   }
-  const bytes = await tr4kerDownloadBytes(cand.slug, apiKey);
+  const hit: SearchHit = { slug: cand.slug, name: cand.name, seeders: 0, source: cand.source ?? 'tr4ker', downloadUrl: cand.downloadUrl };
+  const bytes = await watchDownloadBytes(hit, keys);
   await uploadTorrentData(bytes, transmissionPath('series'));
   sub.addedKeys.push(key);
   if (sub.addedKeys.length > 500) sub.addedKeys = sub.addedKeys.slice(-500);
@@ -634,7 +698,7 @@ function mergeHits(lists: SearchHit[][]): SearchHit[] {
 
 async function searchHitsForTarget(
   query: string,
-  apiKey: string,
+  keys: SourceKeys,
   season: number,
   episode?: number,
 ): Promise<SearchHit[]> {
@@ -663,23 +727,39 @@ async function searchHitsForTarget(
     season: String(season),
   });
   const agg = new Map<string, SearchHit>();
-  for (const params of attempts) {
-    try {
-      const items = await tr4kerSearchRaw(query, apiKey, params);
-      for (const it of items) {
-        if (queryMatchesName(query, it.name)) agg.set(it.slug, it);
+  if (keys.tr4kerApiKey.trim()) {
+    for (const params of attempts) {
+      try {
+        const items = await tr4kerSearchRaw(query, keys.tr4kerApiKey, params);
+        for (const it of items) {
+          if (queryMatchesName(query, it.name)) agg.set(it.slug, it);
+        }
+        if (episode != null && episode > 0) {
+          const found = [...agg.values()].some((it) => {
+            const se = parseEpisode(it.name);
+            return !!se && !se.isPack && se.season === season && se.episode === episode;
+          });
+          if (found) break;
+        } else if ([...agg.values()].some((it) => parseEpisode(it.name)?.season === season)) {
+          break;
+        }
+      } catch (e) {
+        if (!isTooBroadError(e)) throw e;
       }
-      if (episode != null && episode > 0) {
-        const found = [...agg.values()].some((it) => {
-          const se = parseEpisode(it.name);
-          return !!se && !se.isPack && se.season === season && se.episode === episode;
-        });
-        if (found) break;
-      } else if ([...agg.values()].some((it) => parseEpisode(it.name)?.season === season)) {
-        break;
+    }
+  }
+  // C411 (Torznab, catégorie séries) : recherche large + ciblée SxxExx ;
+  // le filtrage exact (saison/épisode) est fait par pickBest* ci-dessous.
+  if (keys.c411ApiKey.trim()) {
+    const queries = episode != null && episode > 0 ? [query, `${query} S${padSE(season)}E${padSE(episode)}`] : [query];
+    for (const cq of queries) {
+      try {
+        for (const f of await c411WatchSearch(cq, keys.c411ApiKey)) {
+          if (queryMatchesName(query, f.name)) agg.set(f.slug, f);
+        }
+      } catch {
+        /* source en échec : on garde les autres résultats */
       }
-    } catch (e) {
-      if (!isTooBroadError(e)) throw e;
     }
   }
   return [...agg.values()];
@@ -738,9 +818,9 @@ async function ingestHit(
   sub: SeriesSubscription,
   hit: SearchHit,
   keys: Array<{ season: number; episode: number }>,
-  apiKey: string,
+  sourceKeys: SourceKeys,
 ): Promise<void> {
-  const bytes = await tr4kerDownloadBytes(hit.slug, apiKey);
+  const bytes = await watchDownloadBytes(hit, sourceKeys);
   await uploadTorrentData(bytes, transmissionPath('series'));
   rememberKeys(
     sub,
@@ -754,17 +834,17 @@ export async function requestEpisode(
   subId: string,
   season: number,
   episode: number,
-  apiKey: string,
+  keys: SourceKeys,
 ): Promise<string> {
   const sub = loadSubscriptions().find((s) => s.id === subId);
   if (!sub) throw new SeriesWatchError('Suivi introuvable (rafraîchis la liste).');
   if (hasRetrievedEpisode(sub, season, episode)) {
     throw new SeriesWatchError(`${fmtSE(season, episode)} déjà envoyé vers Transmission.`);
   }
-  const hits = await searchHitsForTarget(sub.query, apiKey, season, episode);
+  const hits = await searchHitsForTarget(sub.query, keys, season, episode);
   const best = pickBestEpisode(hits, season, episode);
   if (!best) throw new SeriesWatchError(`Aucun torrent pour ${sub.title} ${fmtSE(season, episode)}.`);
-  await ingestHit(sub, best, [{ season, episode }], apiKey);
+  await ingestHit(sub, best, [{ season, episode }], keys);
   sub.lastCheckAt = Date.now();
   sub.lastResult = `Récupéré : ${fmtSE(season, episode)}`;
   upsertSubscription(sub);
@@ -777,7 +857,7 @@ export async function requestSeason(
   subId: string,
   season: number,
   episodes: number[],
-  apiKey: string,
+  keys: SourceKeys,
 ): Promise<string> {
   const sub = loadSubscriptions().find((s) => s.id === subId);
   if (!sub) throw new SeriesWatchError('Suivi introuvable (rafraîchis la liste).');
@@ -785,14 +865,14 @@ export async function requestSeason(
   if (wanted.length === 0) throw new SeriesWatchError('Aucun épisode encore diffusé pour cette saison.');
   const pending = wanted.filter((ep) => !hasRetrievedEpisode(sub, season, ep));
   if (pending.length === 0) return `Saison ${season} déjà envoyée vers Transmission.`;
-  let hits = await searchHitsForTarget(sub.query, apiKey, season);
+  let hits = await searchHitsForTarget(sub.query, keys, season);
   const pack = pickBestSeasonPack(hits, season);
   if (pack) {
     await ingestHit(
       sub,
       pack,
       pending.map((episode) => ({ season, episode })),
-      apiKey,
+      keys,
     );
     sub.lastCheckAt = Date.now();
     sub.lastResult = `Récupéré : saison ${season} (pack)`;
@@ -805,7 +885,7 @@ export async function requestSeason(
     if (!pickBestEpisode(hits, season, episode)) missing.push(episode);
   }
   for (const episode of missing) {
-    const extra = await searchHitsForTarget(sub.query, apiKey, season, episode);
+    const extra = await searchHitsForTarget(sub.query, keys, season, episode);
     hits = mergeHits([hits, extra]);
   }
   let cur = sub;
@@ -815,7 +895,7 @@ export async function requestSeason(
     const best = pickBestEpisode(hits, season, episode);
     if (!best) continue;
     try {
-      await ingestHit(cur, best, [{ season, episode }], apiKey);
+      await ingestHit(cur, best, [{ season, episode }], keys);
       added += 1;
       cur.lastCheckAt = Date.now();
       cur.lastResult = `Récupéré : ${fmtSE(season, episode)}`;

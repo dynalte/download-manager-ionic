@@ -26,11 +26,15 @@ import {
   DEFAULT_FOLDER_LIVRES,
   DEFAULT_POLL_INTERVAL,
   setSetting,
+  type C411ProxyMode,
 } from '../services/settings';
 import { requestAuthorizationIfNeeded } from '../services/completionMonitor';
 import { loadSeenSuggestions } from '../services/seenSuggestions';
 import { clearSeenEverywhere } from '../services/seenSync';
 import { testServerConnection } from '../services/serverApi';
+import { testC411Connection } from '../services/c411';
+import { testTmdbConnection } from '../services/tmdb';
+import { requestBrowserOpen } from '../services/browserNavigation';
 import { applyRemoteConfig, fetchRemoteConfig, pushRemoteConfig } from '../services/remoteConfig';
 import { getThemeMode, setThemeMode, type ThemeMode } from '../services/theme';
 
@@ -60,13 +64,23 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [fileServerUser, setFileServerUser] = useStored(Keys.fileServerUsername, AppConfig.fileServerUsername);
   const [fileServerPass, setFileServerPass] = useStored(Keys.fileServerPassword, AppConfig.fileServerPassword);
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
+  const [c411ApiKey, setC411ApiKey] = useStored(Keys.c411ApiKey, AppConfig.c411ApiKey);
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
   const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-3.5-flash-lite');
+  const [tmdbApiKey, setTmdbApiKey] = useStored(Keys.tmdbApiKey, '');
   const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'http://photos2.dynaspirit.com:8080/api-download-manager.php');
   const [seenSyncToken, setSeenSyncToken] = useStored(Keys.seenSyncToken, '');
   const [seenCount, setSeenCount] = useState(0);
   const [syncTestMsg, setSyncTestMsg] = useState('');
   const [syncTesting, setSyncTesting] = useState(false);
+  const [c411TestMsg, setC411TestMsg] = useState('');
+  const [c411Testing, setC411Testing] = useState(false);
+  const [tmdbTestMsg, setTmdbTestMsg] = useState('');
+  const [tmdbTesting, setTmdbTesting] = useState(false);
+  const [c411ProxyMode, setC411ProxyModeState] = useState<C411ProxyMode>(() => {
+    const v = localStorage.getItem(Keys.c411ProxyMode) ?? 'proxy';
+    return v === 'direct' || v === 'auto' ? v : 'proxy';
+  });
   const [syncPullMsg, setSyncPullMsg] = useState('');
   const [syncPulling, setSyncPulling] = useState(false);
   const [syncPushing, setSyncPushing] = useState(false);
@@ -89,8 +103,10 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
     str(Keys.fileServerUsername, setFileServerUser);
     str(Keys.fileServerPassword, setFileServerPass);
     str(Keys.tr4kerApiKey, setTr4kerApiKey);
+    str(Keys.c411ApiKey, setC411ApiKey);
     str(Keys.geminiApiKey, setGeminiApiKey);
     str(Keys.geminiModel, setGeminiModel);
+    str(Keys.tmdbApiKey, setTmdbApiKey);
     str(Keys.plexBaseURL, setPlexBaseURL);
     str(Keys.plexToken, setPlexToken);
     str(Keys.plexSectionKeysCSV, setPlexSectionKeysCSV);
@@ -98,6 +114,22 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       const on = cfg[Keys.plexUseCloud] === '1' || cfg[Keys.plexUseCloud] === 'true';
       setPlexUseCloudState(on);
       setSetting(Keys.plexUseCloud, on ? '1' : '0');
+    }
+    if (cfg[Keys.tr4kerEnabled] !== undefined) {
+      const on = cfg[Keys.tr4kerEnabled] === '1' || cfg[Keys.tr4kerEnabled] === 'true';
+      setTr4kerEnabledState(on);
+      setSetting(Keys.tr4kerEnabled, on ? '1' : '0');
+    }
+    if (cfg[Keys.c411Enabled] !== undefined) {
+      const on = cfg[Keys.c411Enabled] === '1' || cfg[Keys.c411Enabled] === 'true';
+      setC411EnabledState(on);
+      setSetting(Keys.c411Enabled, on ? '1' : '0');
+    }
+    if (cfg[Keys.c411ProxyMode] !== undefined) {
+      const m = cfg[Keys.c411ProxyMode];
+      const mode: C411ProxyMode = m === 'direct' || m === 'auto' ? m : 'proxy';
+      setC411ProxyModeState(mode);
+      setSetting(Keys.c411ProxyMode, mode);
     }
     if (cfg[Keys.downloadNotificationsEnabled] !== undefined) {
       const on = cfg[Keys.downloadNotificationsEnabled] !== '0' && cfg[Keys.downloadNotificationsEnabled] !== 'false';
@@ -152,6 +184,8 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [plexToken, setPlexToken] = useStored(Keys.plexToken, AppConfig.plexToken);
   const [plexSectionKeysCSV, setPlexSectionKeysCSV] = useStored(Keys.plexSectionKeysCSV, '');
   const [plexUseCloud, setPlexUseCloudState] = useState(() => (localStorage.getItem(Keys.plexUseCloud) ?? '') === '1');
+  const [tr4kerEnabled, setTr4kerEnabledState] = useState(() => (localStorage.getItem(Keys.tr4kerEnabled) ?? '1') !== '0');
+  const [c411Enabled, setC411EnabledState] = useState(() => (localStorage.getItem(Keys.c411Enabled) ?? '1') !== '0');
   const [notificationsEnabled, setNotificationsEnabledState] = useState(
     () => (localStorage.getItem(Keys.downloadNotificationsEnabled) ?? '1') !== '0',
   );
@@ -293,6 +327,100 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           <IonItem>
             <IonInput label="Clé API TR4KER" labelPlacement="stacked" type="password" value={tr4kerApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setTr4kerApiKey(String(e.detail.value ?? ''))} />
           </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Utiliser TR4KER pour les recherches et le suivi</p>
+            </IonLabel>
+            <IonToggle
+              slot="end"
+              checked={tr4kerEnabled}
+              onIonChange={(e) => {
+                setTr4kerEnabledState(e.detail.checked);
+                setSetting(Keys.tr4kerEnabled, e.detail.checked ? '1' : '0');
+              }}
+            />
+          </IonItem>
+
+          <IonItem>
+            <IonLabel>
+              <h2>Catalogue torrent (C411)</h2>
+              <p>Clé « Intégrations API » du profil c411.org (c411.org/user/integrations). Recherche Catalogue + Suggestions + Suivis, en plus de TR4KER.</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              onClick={() => {
+                requestBrowserOpen('https://c411.org/user/integrations');
+                onClose();
+              }}
+            >
+              Obtenir la clé
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonInput label="Clé API C411" labelPlacement="stacked" type="password" value={c411ApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setC411ApiKey(String(e.detail.value ?? ''))} />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Utiliser C411 pour les recherches et le suivi</p>
+            </IonLabel>
+            <IonToggle
+              slot="end"
+              checked={c411Enabled}
+              onIonChange={(e) => {
+                setC411EnabledState(e.detail.checked);
+                setSetting(Keys.c411Enabled, e.detail.checked ? '1' : '0');
+              }}
+            />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>{c411TestMsg || 'Vérifie la connexion au tracker et la validité de la clé.'}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              disabled={c411Testing}
+              onClick={() => {
+                setC411Testing(true);
+                setC411TestMsg('');
+                void testC411Connection(c411ApiKey)
+                  .then((msg) => setC411TestMsg(msg))
+                  .catch((e) => setC411TestMsg(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setC411Testing(false));
+              }}
+            >
+              {c411Testing ? 'Test…' : 'Tester'}
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Accès C411 : proxy = tout passe par le serveur PHP (recommandé, contourne le blocage direct).</p>
+            </IonLabel>
+          </IonItem>
+          <div style={{ padding: '0 16px 8px' }}>
+            <IonSegment
+              value={c411ProxyMode}
+              onIonChange={(e) => {
+                const v = String(e.detail.value);
+                const mode: C411ProxyMode = v === 'direct' || v === 'auto' ? v : 'proxy';
+                setC411ProxyModeState(mode);
+                setSetting(Keys.c411ProxyMode, mode);
+              }}
+            >
+              <IonSegmentButton value="proxy">
+                <IonLabel>Proxy</IonLabel>
+              </IonSegmentButton>
+              <IonSegmentButton value="auto">
+                <IonLabel>Auto</IonLabel>
+              </IonSegmentButton>
+              <IonSegmentButton value="direct">
+                <IonLabel>Direct</IonLabel>
+              </IonSegmentButton>
+            </IonSegment>
+          </div>
 
           <IonItem>
             <IonLabel>
@@ -305,6 +433,48 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           </IonItem>
           <IonItem>
             <IonInput label="Modèle Gemini" labelPlacement="stacked" value={geminiModel} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setGeminiModel(String(e.detail.value ?? ''))} placeholder="gemini-3.5-flash-lite" />
+          </IonItem>
+
+          <IonItem>
+            <IonLabel>
+              <h2>Affiches TMDB (Catalogue)</h2>
+              <p>Clé API gratuite (themoviedb.org/settings/api). Affiche les visuels quand Allociné est bloqué.</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              onClick={() => {
+                requestBrowserOpen('https://www.themoviedb.org/settings/api');
+                onClose();
+              }}
+            >
+              Obtenir la clé
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonInput label="Clé API TMDB" labelPlacement="stacked" type="password" value={tmdbApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setTmdbApiKey(String(e.detail.value ?? ''))} placeholder="..." />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>{tmdbTestMsg || 'Vérifie la validité de la clé.'}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              disabled={tmdbTesting}
+              onClick={() => {
+                setTmdbTesting(true);
+                setTmdbTestMsg('');
+                void testTmdbConnection(tmdbApiKey)
+                  .then((msg) => setTmdbTestMsg(msg))
+                  .catch((e) => setTmdbTestMsg(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setTmdbTesting(false));
+              }}
+            >
+              {tmdbTesting ? 'Test…' : 'Tester'}
+            </IonButton>
           </IonItem>
           <IonItem>
             <IonLabel>

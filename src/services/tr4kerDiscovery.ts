@@ -94,6 +94,10 @@ export interface DiscoveryFilm {
   catSlug?: string;
   isFreeleech: boolean;
   tmdbId?: number;
+  /** Tracker d'origine (C411 : voir c411.ts, recherche fusionnée). */
+  source: 'tr4ker' | 'c411';
+  /** URL du .torrent (source C411 : enclosure Torznab, clé incluse). */
+  downloadUrl?: string;
 }
 
 export class DiscoveryError extends Error {}
@@ -157,6 +161,7 @@ function normalizeItem(raw: RawItem): DiscoveryFilm | null {
     catSlug: raw.cat_slug || undefined,
     isFreeleech: !!raw.is_freeleech,
     tmdbId: typeof raw.tmdb_id === 'number' && raw.tmdb_id > 0 ? raw.tmdb_id : undefined,
+    source: 'tr4ker',
   };
 }
 

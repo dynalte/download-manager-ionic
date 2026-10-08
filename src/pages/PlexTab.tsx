@@ -248,7 +248,13 @@ const PlexTab: React.FC = () => {
         ].join('\n'),
       );
       if (list.length === 0) {
-        setPlaybackMsg(`Aucun lecteur Plex detecte (${dbg}). Ouvre l’app Plex sur la Fire TV (même compte, même Wi-Fi) puis réessaie — ou « Lire dans le navigateur » sur la fiche.`);
+        // Sélecteur quand même : ajout manuel par IP + lecture Plex Web
+        // restent possibles sans aucun lecteur détecté.
+        setPlayers([]);
+        setPlaybackMsg(
+          `Aucun lecteur Plex detecte (${dbg}). Ta Fire TV affiche debian2 mais reste invisible ? Vérifie sur la TV : app Plex connectée au MÊME compte (${debug.account || 'voir diagnostic'}), même Wi-Fi, app OUVERTE — ou ajoute-la par son IP ci-dessous, ou « Lire dans le navigateur ».`,
+        );
+        setShowPlayerPicker(true);
         return;
       }
       const online = list.filter((p) => p.presence === true).length;

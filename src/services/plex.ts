@@ -233,6 +233,70 @@ function connScore(c: ResourceConn): number {
   return s;
 }
 
+/** IP privée (LAN) ? */
+function isPrivateHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (h === 'localhost' || h.endsWith('.local')) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const a = +m[1];
+  const b = +m[2];
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** Extrait l'IP d'un hôte plex.direct (192-168-1-91.<hash>.plex.direct -> 192.168.1.91). */
+function plexDirectIP(host: string): string | null {
+  const m = /^(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.[0-9a-f]+\.plex\.direct$/i.exec(host.trim());
+  if (!m) return null;
+  const parts = [m[1], m[2], m[3], m[4]];
+  if (parts.some((p) => +p > 255)) return null;
+  return parts.join('.');
+}
+
+/**
+ * URL https d'un LECTEUR via plex.direct (même mécanisme que les serveurs :
+ * IP en pointillés + identifiant, certificat provisionné par plex.tv).
+ * Permet de commander la TV depuis une page HTTPS (mixed-content sinon).
+ * Retourne null si non constructible (pas une IPv4 ou pas d'identifiant).
+ */
+function httpsPlayerURL(ip: string, machineId: string, port: string): string | null {
+  const cleanIP = ip.trim();
+  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(cleanIP)) return null;
+  if (cleanIP.split('.').some((p) => +p > 255)) return null;
+  const hash = machineId.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!hash) return null;
+  const pp = port.trim() || '32500';
+  return `https://${cleanIP.replace(/\./g, '-')}.${hash}.plex.direct:${pp}`;
+}
+
+/**
+ * Adresse du serveur telle que le LECTEUR peut la joindre (le lecteur va y
+ * chercher média + playQueue). Si lecteur et serveur sont sur le même LAN,
+ * préfère le http://IP-locale:32400 (le plex.direct https externe est plus
+ * lent et parfois injoignable depuis la TV).
+ */
+function serverAddressForPlayer(
+  ctx: ServerContext,
+  playerBase: string,
+): { protocol: string; host: string; port: string } {
+  let playerLan = false;
+  try {
+    playerLan = isPrivateHost(new URL(playerBase).hostname);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const u = new URL(ctx.baseURL);
+    const embedded = plexDirectIP(u.hostname);
+    if (playerLan && embedded && isPrivateHost(embedded)) {
+      return { protocol: 'http', host: embedded, port: u.port || '32400' };
+    }
+    return { protocol: u.protocol.replace(':', ''), host: u.hostname, port: u.port || '32400' };
+  } catch {
+    return { protocol: 'http', host: ctx.baseURL, port: '32400' };
+  }
+}
+
 async function fetchResourcesDevices(token: string): Promise<Element[]> {
   const res = await fetch(`https://plex.tv/api/resources?includeHttps=1&X-Plex-Token=${encodeURIComponent(token)}`, {
     headers: { 'X-Plex-Product': PRODUCT, 'X-Plex-Client-Identifier': PRODUCT },
@@ -324,6 +388,9 @@ function saveLastGoodServerURL(url: string): void {
     /* stockage indisponible */
   }
 }
+
+/** Ports d'écoute connus des lecteurs Plex (le 32500 n'est pas toujours ouvert). */
+const PLAYER_PROBE_PORTS = ['32500', '32433', '8324', '3005', '32400', '8080', '8000', '8888'];
 
 /** Première URL répondant comme PMS, sans attendre les connexions mortes. */
 async function firstWinningConn(urls: string[], token: string, timeoutMs: number): Promise<string | null> {
@@ -871,66 +938,86 @@ async function probePlayerPresence(baseURL: string, token: string): Promise<void
 }
 
 /**
- * Sonde http://IP:32500/resources et enregistre le lecteur.
+ * Sonde http://IP:PORT/resources et enregistre le lecteur.
+ * Le 32500 n'est pas toujours ouvert (selon app/version) : replis sur les
+ * autres ports d'écoute connus (desktop 32433, Roku 8324, PMP 3005).
  * NOTE : certains lecteurs ne répondent que pendant/après une lecture :
- * si ça échoue, lance une vidéo sur la TV puis réessaie.
+ * si ça échoue, lance une vidéo sur la TV puis réessaie (app au premier plan).
  */
 export async function probeAndAddManualPlayer(
   hostOrURL: string,
   port: string,
   token: string,
 ): Promise<PlexPlayerTarget> {
-  const base = normalizePlayerBaseURL(hostOrURL, port);
-  let text = '';
-  let status = 0;
-  try {
-    const res = await fetchWithTimeout(`${base}/resources`, { headers: plexHeaders(token) }, 8000);
-    status = res.status;
-    text = await res.text().catch(() => '');
-  } catch (e) {
-    throw new PlexError(
-      `TV injoignable sur ${base} (${e instanceof Error && e.name === 'AbortError' ? 'délai dépassé' : e instanceof Error ? e.message : String(e)}). ` +
-        `Vérifie l'IP (Réglages réseau de la Fire TV), le même Wi-Fi, et rebuild l'app (réseau local iOS requis).`,
-    );
+  const firstBase = normalizePlayerBaseURL(hostOrURL, port);
+  const triedPorts = [firstBase];
+  for (const p of PLAYER_PROBE_PORTS) {
+    try {
+      const b = normalizePlayerBaseURL(hostOrURL, p);
+      if (!triedPorts.includes(b)) triedPorts.push(b);
+    } catch {
+      /* ignore */
+    }
   }
-  const doc = new DOMParser().parseFromString(text, 'text/xml');
-  const candidates = [
-    doc.documentElement,
-    ...Array.from(doc.getElementsByTagName('Player')),
-    ...Array.from(doc.getElementsByTagName('Device')),
-    ...Array.from(doc.getElementsByTagName('MediaContainer')),
-  ];
-  const found = candidates.find((el) => el && el.getAttribute && el.getAttribute('machineIdentifier'));
-  const machineId = found?.getAttribute('machineIdentifier') ?? undefined;
-  if (!machineId) {
-    throw new PlexError(
-      `La TV répond sur ${base} (HTTP ${status}) mais sans identifiant. Lance une lecture sur la TV puis réessaie.`,
-    );
+  const isHttpsPage = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  const lanHttpBlocked = isHttpsPage && firstBase.startsWith('http://');
+  let lastErr = '';
+  for (const base of triedPorts) {
+    try {
+      const res = await fetchWithTimeout(`${base}/resources`, { headers: plexHeaders(token) }, 6000);
+      const text = await res.text().catch(() => '');
+      const doc = new DOMParser().parseFromString(text, 'text/xml');
+      const candidates = [
+        doc.documentElement,
+        ...Array.from(doc.getElementsByTagName('Player')),
+        ...Array.from(doc.getElementsByTagName('Device')),
+        ...Array.from(doc.getElementsByTagName('MediaContainer')),
+      ];
+      const found = candidates.find((el) => el && el.getAttribute && el.getAttribute('machineIdentifier'));
+      const machineId = found?.getAttribute('machineIdentifier') ?? undefined;
+      if (!machineId) {
+        lastErr = `répond (HTTP ${res.status}) mais sans identifiant`;
+        continue;
+      }
+      const name = found?.getAttribute('deviceName') ?? found?.getAttribute('title') ?? found?.getAttribute('name') ?? 'Fire TV';
+      const entry: ManualPlayerEntry = {
+        baseURL: base,
+        targetClientIdentifier: machineId,
+        name,
+        product: found?.getAttribute('product') ?? 'Plex for Android (TV)',
+        platform: found?.getAttribute('platform') ?? 'Android',
+        addedAt: Date.now(),
+      };
+      const others = getManualPlayers().filter((m) => m.baseURL !== base);
+      saveManualPlayers([...others, entry]);
+      plexLog('info', `lecteur manuel ajoute: "${entry.name}" id=${machineId} base=${base}`);
+      return {
+        id: `manual|${base}`,
+        targetClientIdentifier: machineId,
+        name: entry.name,
+        product: entry.product,
+        platform: entry.platform,
+        baseURL: base,
+        connections: [base],
+        source: 'manual',
+        presence: true,
+        displayName: entry.name,
+      };
+    } catch (e) {
+      lastErr =
+        e instanceof Error && e.name === 'AbortError'
+          ? 'délai dépassé'
+          : e instanceof Error
+            ? e.message
+            : String(e);
+    }
   }
-  const name = found?.getAttribute('deviceName') ?? found?.getAttribute('title') ?? found?.getAttribute('name') ?? 'Fire TV';
-  const entry: ManualPlayerEntry = {
-    baseURL: base,
-    targetClientIdentifier: machineId,
-    name,
-    product: found?.getAttribute('product') ?? 'Plex for Android (TV)',
-    platform: found?.getAttribute('platform') ?? 'Android',
-    addedAt: Date.now(),
-  };
-  const others = getManualPlayers().filter((m) => m.baseURL !== base);
-  saveManualPlayers([...others, entry]);
-  plexLog('info', `lecteur manuel ajoute: "${entry.name}" id=${machineId} base=${base}`);
-  return {
-    id: `manual|${base}`,
-    targetClientIdentifier: machineId,
-    name: entry.name,
-    product: entry.product,
-    platform: entry.platform,
-    baseURL: base,
-    connections: [base],
-    source: 'manual',
-    presence: true,
-    displayName: entry.name,
-  };
+  throw new PlexError(
+    `TV injoignable sur ${firstBase} (ports essayés : ${triedPorts.map((b) => b.split(':').pop()).join(', ')} — ${lastErr}). ` +
+      (lanHttpBlocked
+        ? `Page en HTTPS : le navigateur bloque le http:// local (mixed-content). Ouvre la PWA en http:// (port 8080) ou l'app native. `
+        : `Vérifie l'IP (Réglages réseau de la Fire TV), le même Wi-Fi, et que l'app Plex est OUVERTE sur la TV (au premier plan). `),
+  );
 }
 
 export async function fetchPlayersDetailed(
@@ -1113,6 +1200,12 @@ export async function fetchPlayersDetailed(
       debug.clientsCount += clientEls.length;
       plexLog('info', `/clients sur ${ctx.baseURL} -> ${clientEls.length} lecteur(s)`);
       clientEls.forEach((el, i) => {
+        try {
+          const attrs = Array.from({ length: el.attributes.length }, (_, k) => `${el.attributes[k].name}=${el.attributes[k].value}`).join(' ');
+          plexLog('info', `/clients attrs: ${attrs.slice(0, 500)}`);
+        } catch {
+          /* ignore */
+        }
         const host = el.getAttribute('host') ?? el.getAttribute('address') ?? '';
         if (!host) return;
         const scheme = el.getAttribute('protocol') ?? 'http';
@@ -1144,13 +1237,35 @@ export async function fetchPlayersDetailed(
       const playerEls = Array.from(sessions.getElementsByTagName('Player'));
       debug.sessionsCount += playerEls.length;
       playerEls.forEach((el, i) => {
+        try {
+          const attrs = Array.from({ length: el.attributes.length }, (_, k) => `${el.attributes[k].name}=${el.attributes[k].value}`).join(' ');
+          plexLog('info', `/sessions player attrs: ${attrs.slice(0, 600)}`);
+        } catch {
+          /* ignore */
+        }
         // Ne plus jeter : repli sur un id local (lecture impossible mais visible).
         const machineId =
           el.getAttribute('machineIdentifier') ?? el.getAttribute('device') ?? `noid-session-${i}`;
         const name = el.getAttribute('title') ?? el.getAttribute('device') ?? 'Lecteur Plex';
         const address = el.getAttribute('address');
         const port = el.getAttribute('port');
-        const direct = address && port ? `http://${address}:${port}` : undefined;
+        // Adresse sans port (cas Fire TV) : décline les ports d'écoute connus.
+        // Le flux direct essaiera chacun jusqu'à acceptation (échecs rapides en LAN).
+        // Variante https plex.direct (certificat plex.tv) pour les pages HTTPS.
+        const playerBases: string[] = [];
+        if (address) {
+          const ports: string[] = [];
+          for (const p of [port ?? '', ...PLAYER_PROBE_PORTS]) {
+            const pp = p.trim();
+            if (pp && !ports.includes(pp)) ports.push(pp);
+          }
+          for (const pp of ports) playerBases.push(`http://${address}:${pp}`);
+          for (const pp of ports.slice(0, 2)) {
+            const httpsURL = httpsPlayerURL(address, machineId, pp);
+            if (httpsURL && !playerBases.includes(httpsURL)) playerBases.push(httpsURL);
+          }
+        }
+        const direct = playerBases[0];
         upsert({
           id: `sessions|${i}|${machineId}`,
           targetClientIdentifier: machineId,
@@ -1158,7 +1273,7 @@ export async function fetchPlayersDetailed(
           product: el.getAttribute('product') ?? '',
           platform: el.getAttribute('platform') ?? '',
           baseURL: direct,
-          connections: direct ? [direct] : [],
+          connections: playerBases,
           source: 'sessions',
           presence: true,
           displayName: name,
@@ -1284,7 +1399,7 @@ async function resolvePlayableItem(
   };
 }
 
-/** Lecture distante : crée une playQueue puis envoie playMedia (comme Swift / python-plexapi). */
+/** Lecture distante : crée une playQueue puis envoie playMedia (flux app officielle). */
 export async function playOnPlayer(
   item: PlexLibraryItem,
   player: PlexPlayerTarget,
@@ -1294,19 +1409,137 @@ export async function playOnPlayer(
   const playable = await resolvePlayableItem(item, baseURLString, token);
   plexLog('info', `lecture "${playable.title}" (${playable.type}/${playable.ratingKey}) -> "${player.name}" [${player.product}]`);
   if (player.presence === false) {
-    plexLog('warn', `"${player.name}" hors ligne selon plex.tv : commande quand meme tentee (direct LAN en repli)`);
+    plexLog('warn', `"${player.name}" hors ligne selon plex.tv : commande quand meme tentee`);
   }
   const mediaType = playable.type.toLowerCase() === 'track' || playable.type.toLowerCase() === 'album' ? 'audio' : 'video';
   const targetHeaders = plexHeaders(token, { 'X-Plex-Target-Client-Identifier': player.targetClientIdentifier });
 
-  // 1) Via chaque serveur joignable : la TV peut être connectée à n'importe
-  // lequel (pas forcément celui configuré). L'app officielle fait pareil :
-  // playQueue sur LE serveur, puis playMedia relayé par LUI.
+  // Timeout borné : via le relay plex.tv une requête peut pendre des minutes
+  // sans jamais répondre ("ça ne fait rien", aucun message). 25 s puis on
+  // passe à la tentative suivante.
+  const COMMAND_TIMEOUT_MS = 25000;
+  const timeoutErr = (e: unknown) =>
+    e instanceof Error && e.name === 'AbortError' ? 'délai dépassé (25 s, relay lent ?)' : e instanceof Error ? e.message : String(e);
   const serverCtxs = await resolveAllServerContexts(baseURLString, token);
   if (serverCtxs.length === 0) throw new PlexError('Aucun serveur Plex joignable pour lancer la lecture.');
   let serverErr = '';
-  let directCtx: ServerContext | null = null;
-  let directQueueID = '';
+  let queueCtx: ServerContext | null = null;
+  let queueID = '';
+
+  /** PlayQueue sur UN serveur (la file vit côté serveur, quel que soit l'accès). */
+  async function createQueue(ctx: ServerContext): Promise<string> {
+    const uri = `server://${ctx.machineIdentifier}/com.plexapp.plugins.library/library/metadata/${playable.ratingKey}`;
+    const queueURL =
+      `${ctx.baseURL}/playQueues?type=${mediaType === 'audio' ? 'audio' : 'video'}` +
+      `&uri=${encodeURIComponent(uri)}&shuffle=0&repeat=0&continuous=1&own=1`;
+    plexLog('info', `via serveur ${ctx.baseURL} -> creation playQueue...`);
+    const queueRes = await fetchWithTimeout(
+      queueURL,
+      { method: 'POST', headers: { ...plexHeaders(token), Accept: 'application/json' } },
+      COMMAND_TIMEOUT_MS,
+    );
+    if (!queueRes.ok) throw new PlexError(`playQueue HTTP ${queueRes.status}`);
+    const queueText = await queueRes.text();
+    const queueMatch = /playQueueID="(\d+)"/.exec(queueText) || /"playQueueID":\s*(\d+)/.exec(queueText);
+    if (!queueMatch) throw new PlexError('reponse playQueue invalide');
+    return queueMatch[1];
+  }
+
+  // 1) Flux officiel : playMedia DIRECTEMENT au lecteur (l'app officielle ne
+  // passe pas par le relais serveur). Le lecteur va chercher média + file sur
+  // le serveur : l'adresse fournie doit être joignable DEPUIS le lecteur
+  // (LAN http:// si TV et serveur au même domicile).
+  // Page HTTPS -> base http:// locale : le navigateur bloque (mixed-content)
+  // AVANT tout réseau. Ces bases sont sautées (les variantes https plex.direct
+  // restent essayées) ; si aucune ne passe, message explicite ci-dessous.
+  const httpsPage = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  const directBases = [...new Set([player.baseURL, ...(player.connections ?? [])].filter(Boolean) as string[])];
+  const skippedHttp = httpsPage ? directBases.filter((b) => b.startsWith('http://')) : [];
+  const triedBases = directBases.filter((b) => !b.startsWith('http://') || !httpsPage);
+  let directErr = skippedHttp.length > 0 && triedBases.length === 0 ? 'bases http:// inaccessibles depuis une page HTTPS (mixed-content)' : '';
+  if (triedBases.length > 0) {
+    for (const ctx of serverCtxs) {
+      try {
+        queueID = await createQueue(ctx);
+        queueCtx = ctx;
+        break;
+      } catch (e) {
+        serverErr = `${ctx.baseURL}: ${timeoutErr(e)}`;
+        plexLog('warn', `via serveur ${ctx.baseURL} -> ${serverErr}`);
+      }
+    }
+    if (queueCtx) {
+      const params = new URLSearchParams({
+        offset: '0',
+        commandID: String(Date.now()),
+        type: mediaType === 'audio' ? 'music' : 'video',
+        key: `/library/metadata/${playable.ratingKey}`,
+        // window=xxx requis pour les lecteurs "oblivious" (Fire TV/Roku).
+        containerKey: `/playQueues/${queueID}?window=200&own=1`,
+        providerIdentifier: 'com.plexapp.plugins.library',
+        token,
+      });
+      // Envoi parallèle, premier accepté gagne (8 ports × 25 s en séquence
+      // serait interminable si filtrés ; en LAN les refus sont instantanés).
+      const DIRECT_TIMEOUT_MS = 8000;
+      const directWin = await new Promise<string | null>((resolve) => {
+        if (triedBases.length === 0) {
+          resolve(null);
+          return;
+        }
+        let done = false;
+        let settled = 0;
+        for (const base of triedBases) {
+          void (async () => {
+            // Commande directe au lecteur (téléphone -> TV en LAN, ou https
+            // plex.direct depuis une page HTTPS) : l'adresse serveur transmise
+            // est celle joignable depuis le lecteur.
+            const serverAddr = serverAddressForPlayer(queueCtx as ServerContext, base);
+            const q = new URLSearchParams(params);
+            q.set('machineIdentifier', (queueCtx as ServerContext).machineIdentifier);
+            q.set('protocol', serverAddr.protocol);
+            q.set('address', serverAddr.host);
+            q.set('port', serverAddr.port);
+            try {
+              const directURL = `${base.replace(/\/$/, '')}/player/playback/playMedia?${q.toString()}`;
+              if (!done) plexLog('info', `direct lecteur ${base} (serveur vu en ${serverAddr.protocol}://${serverAddr.host}:${serverAddr.port})...`);
+              const res = await fetchWithTimeout(
+                directURL,
+                {
+                  headers: plexHeaders(player.accessToken ?? token, {
+                    'X-Plex-Target-Client-Identifier': player.targetClientIdentifier,
+                  }),
+                },
+                DIRECT_TIMEOUT_MS,
+              );
+              const body = await res.text().catch(() => '');
+              if (!done) plexLog('info', `direct ${base} -> HTTP ${res.status}`);
+              if (res.ok && !/<Response[^>]*code="(4\d\d|5\d\d)"/.test(body)) {
+                if (!done) {
+                  done = true;
+                  plexLog('info', `direct ${base} -> commande acceptee`);
+                  resolve(base);
+                }
+                return;
+              }
+              if (!done) directErr = `HTTP ${res.status} ${body.slice(0, 200)}`;
+            } catch (e) {
+              if (!done) {
+                directErr = timeoutErr(e);
+                plexLog('warn', `direct ${base} -> echec (${directErr})`);
+              }
+            }
+            settled += 1;
+            if (settled === triedBases.length && !done) resolve(null);
+          })();
+        }
+      });
+      if (directWin) return;
+    }
+  }
+
+  // 2) Repli historique : playMedia relayé PAR le serveur (PMS < 1.43 ;
+  // PMS 1.43+ a supprimé la route -> 404 HTML, détecté ci-dessous).
   // Params partagés (sauf machineIdentifier/address/port/key/containerKey par serveur).
   const staticParams = new URLSearchParams({
     offset: '0',
@@ -1315,38 +1548,12 @@ export async function playOnPlayer(
     providerIdentifier: 'com.plexapp.plugins.library',
     token,
   });
-  // Timeout borné : via le relay plex.tv une requête peut pendre des minutes
-  // sans jamais répondre ("ça ne fait rien", aucun message). 25 s puis on
-  // passe au serveur suivant / au repli direct.
-  const COMMAND_TIMEOUT_MS = 25000;
-  const timeoutErr = (e: unknown) =>
-    e instanceof Error && e.name === 'AbortError' ? 'délai dépassé (25 s, relay lent ?)' : e instanceof Error ? e.message : String(e);
   for (const ctx of serverCtxs) {
     try {
-      const uri = `server://${ctx.machineIdentifier}/com.plexapp.plugins.library/library/metadata/${playable.ratingKey}`;
-      const queueURL =
-        `${ctx.baseURL}/playQueues?type=${mediaType === 'audio' ? 'audio' : 'video'}` +
-        `&uri=${encodeURIComponent(uri)}&shuffle=0&repeat=0&continuous=1&own=1`;
-      plexLog('info', `via serveur ${ctx.baseURL} -> creation playQueue...`);
-      const queueRes = await fetchWithTimeout(
-        queueURL,
-        { method: 'POST', headers: { ...plexHeaders(token), Accept: 'application/json' } },
-        COMMAND_TIMEOUT_MS,
-      );
-      if (!queueRes.ok) {
-        serverErr = `${ctx.baseURL}: playQueue HTTP ${queueRes.status}`;
-        plexLog('warn', `via serveur ${ctx.baseURL} -> ${serverErr}`);
-        continue;
+      if (!queueID || queueCtx?.baseURL !== ctx.baseURL) {
+        queueID = await createQueue(ctx);
+        queueCtx = ctx;
       }
-      const queueText = await queueRes.text();
-      const queueMatch = /playQueueID="(\d+)"/.exec(queueText) || /"playQueueID":\s*(\d+)/.exec(queueText);
-      if (!queueMatch) {
-        serverErr = `${ctx.baseURL}: reponse playQueue invalide`;
-        continue;
-      }
-      // PlayQueue créée : mémorise pour le repli direct.
-      directCtx = ctx;
-      directQueueID = queueMatch[1];
       const serverURL = new URL(ctx.baseURL);
       // X-Plex-Target-Client-Identifier DOIT être un header, pas un query
       // param (sinon le serveur répond 200 sans rien jouer).
@@ -1357,23 +1564,24 @@ export async function playOnPlayer(
         port: serverURL.port || '32400',
         key: `/library/metadata/${playable.ratingKey}`,
         // window=xxx requis pour les lecteurs "oblivious" (Fire TV/Roku).
-        containerKey: `/playQueues/${queueMatch[1]}?window=200&own=1`,
+        containerKey: `/playQueues/${queueID}?window=200&own=1`,
       });
       for (const [k, v] of staticParams) params.set(k, v);
       const viaServerURL = `${ctx.baseURL}/player/playback/playMedia?${params.toString()}`;
       plexLog(
         'info',
-        `via serveur ${ctx.baseURL} -> envoi playMedia (queue ${queueMatch[1]}, key=/library/metadata/${playable.ratingKey}, ` +
+        `via serveur ${ctx.baseURL} -> envoi playMedia (queue ${queueID}, key=/library/metadata/${playable.ratingKey}, ` +
           `target=${player.targetClientIdentifier}, serverMID=${ctx.machineIdentifier || 'VIDE!'})...`,
       );
       let playRes = await fetchWithTimeout(viaServerURL, { headers: targetHeaders }, COMMAND_TIMEOUT_MS);
       let body = await playRes.text().catch(() => '');
-      // PMS 1.43+ répond parfois 404 en GET sur le proxy Companion : retente
-      // une fois en POST avant de conclure (sans effet si la route a disparu).
-      if (playRes.status === 404) {
-        plexLog('info', `via serveur ${ctx.baseURL} -> GET 404, nouvel essai en POST...`);
-        playRes = await fetchWithTimeout(viaServerURL, { method: 'POST', headers: targetHeaders }, COMMAND_TIMEOUT_MS);
-        body = await playRes.text().catch(() => '');
+      // PMS 1.43+ : la route relais Companion a disparu (404 HTML, vérifié
+      // GET+POST+PUT) — inutile de retenter en POST, la commande via
+      // serveur est impossible sur ce PMS (repli : Plex Web + Cast).
+      if (playRes.status === 404 && /<html/i.test(body)) {
+        serverErr = `${ctx.baseURL}: relais playMedia supprimé par PMS (404)`;
+        plexLog('warn', `via serveur ${ctx.baseURL} -> ${serverErr}`);
+        break;
       }
       plexLog('info', `via serveur ${ctx.baseURL} -> HTTP ${playRes.status} (${body.slice(0, 120) || 'corps vide'})`);
       if (playRes.ok) {
@@ -1394,64 +1602,17 @@ export async function playOnPlayer(
     }
   }
 
-  // 2) Repli direct vers le lecteur (indispensable Fire TV/Roku en LAN).
-  // NOTE iOS : requiert NSAllowsLocalNetworking (scripts/cap-ios-ats.cjs),
-  // sinon le fetch http://192.168.x.x:32500 est bloqué par ATS.
-  const directBases = [...new Set([player.baseURL, ...(player.connections ?? [])].filter(Boolean) as string[])];
-  plexLog('info', `repli direct -> ${directBases.length} adresse(s) a essayer`);
-  let directErr = '';
-  // Params directs adossés à la playQueue créée sur le premier serveur OK.
-  const params = (() => {
-    const fallback = serverCtxs[0];
-    const c = directCtx ?? fallback;
-    const u = new URL(c.baseURL);
-    const p = new URLSearchParams({
-      machineIdentifier: c.machineIdentifier,
-      protocol: u.protocol.replace(':', ''),
-      address: u.hostname,
-      port: u.port || '32400',
-      offset: '0',
-      commandID: String(Date.now()),
-      type: mediaType === 'audio' ? 'music' : 'video',
-      key: `/library/metadata/${playable.ratingKey}`,
-      containerKey: `/playQueues/${directQueueID || '0'}?window=200&own=1`,
-      providerIdentifier: 'com.plexapp.plugins.library',
-      token,
-    });
-    return p;
-  })();
-  for (const base of directBases) {
-    // Ne tente le direct que sur du http(s) LAN, pas sur un relay plex.direct
-    // qui refusera le CORS depuis la WebView.
-    try {
-      const directURL = `${base.replace(/\/$/, '')}/player/playback/playMedia?${params.toString()}`;
-      plexLog('info', `repli direct -> essai ${base}`);
-      const res = await fetchWithTimeout(
-        directURL,
-        {
-          headers: plexHeaders(player.accessToken ?? token, {
-            'X-Plex-Target-Client-Identifier': player.targetClientIdentifier,
-          }),
-        },
-        COMMAND_TIMEOUT_MS,
-      );
-      const body = await res.text().catch(() => '');
-      plexLog('info', `repli direct ${base} -> HTTP ${res.status}`);
-      if (res.ok && !/<Response[^>]*code="(4\d\d|5\d\d)"/.test(body)) return;
-      directErr = `HTTP ${res.status} ${body.slice(0, 200)}`;
-    } catch (e) {
-      directErr = timeoutErr(e);
-      plexLog('warn', `repli direct ${base} -> echec (${directErr})`);
-    }
-  }
-
   throw new PlexError(
     `Lecture Plex echouee sur ${player.name}. ` +
       `Serveur: ${serverErr || 'ok sans effet (lecteur non connecté ?)'}` +
-      (directBases.length
-        ? ` • Direct: ${directErr || 'injoignable'}`
-        : ` • Pas d'adresse directe connue pour ce lecteur (ajoute sa IP via "Ajouter" : 192.168.1.x:32500)`) +
-      ` Astuce Fire TV : ouvre l’app Plex sur la TV (même compte, même Wi-Fi), relance la détection, choisis le lecteur "en ligne".`,
+      (triedBases.length
+        ? ` • Direct lecteur: ${directErr || 'injoignable'}`
+        : directBases.length
+          ? ` • Direct lecteur: ${directErr}`
+          : ` • Pas d'adresse directe connue pour ce lecteur (ajoute sa IP via "Ajouter", ou lance une lecture sur la TV puis Actualiser : son adresse apparaîtra)`) +
+      (/relais playMedia supprimé/.test(serverErr)
+        ? ` Contournement : « Lire dans le navigateur » (Plex Web), puis l’icône Cast de Plex Web vers la Fire TV.`
+        : ` Astuce Fire TV : ouvre l’app Plex sur la TV (même compte, même Wi-Fi), relance la détection, choisis le lecteur "en ligne".`),
   );
 }
 

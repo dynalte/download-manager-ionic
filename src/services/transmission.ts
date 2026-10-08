@@ -145,10 +145,101 @@ export interface RpcResponse {
   json(): Promise<any>;
 }
 
+/** Proxy PHP configuré (Réglages > Synchro vus : URL + token). */
+function isProxyConfigured(): boolean {
+  try {
+    return settings.seenSyncURL !== '' && settings.seenSyncToken !== '';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cas mixed-content : page HTTPS (ex: https://photos2.../download-manager/)
+ * appelant un RPC en http://...:9091. Le navigateur bloque avant même l'envoi
+ * ("Failed to fetch" + warning Mixed Content) : ni CORS ni CSRF/session-id.
+ */
+function isMixedContentCase(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.location) return false;
+    return window.location.protocol === 'https:' && rpcURL().startsWith('http://');
+  } catch {
+    return false;
+  }
+}
+
+function isNetworkFailure(e: unknown): boolean {
+  const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  return /failed to fetch|networkerror|load failed|network request failed/i.test(msg);
+}
+
+/**
+ * RPC via le serveur PHP perso (action=transmission_rpc, même origine HTTPS).
+ * Évite mixed-content + CORS : le PHP (côté LAN) parle au daemon en http://.
+ * Auth Transmission transmise par requête, jamais stockée côté serveur.
+ */
+async function proxyRpcPost(headers: Record<string, string>, body?: string): Promise<RpcResponse> {
+  const base = settings.seenSyncURL.replace(/\/$/, '');
+  if (typeof window !== 'undefined' && window.location?.protocol === 'https:' && base.startsWith('http://')) {
+    throw new TorrentUploadError(
+      'Page HTTPS + API synchro en http:// : bloqué (mixed-content). ' +
+        "Mettez l'URL API en https même origine (ex: https://photos2.dynaspirit.com/download-manager/api-download-manager.php) dans Réglages > Synchro vus.",
+    );
+  }
+  let payload: unknown = {};
+  try {
+    payload = body ? (JSON.parse(body) as unknown) : {};
+  } catch {
+    payload = {};
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${base}?action=transmission_rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Token': settings.seenSyncToken },
+      body: JSON.stringify({
+        payload,
+        sessionId: headers['X-Transmission-Session-Id'] ?? '',
+        authorization: headers['Authorization'] ?? '',
+      }),
+    });
+  } catch (e) {
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new TorrentUploadError(
+      `Proxy Transmission : HTTP ${res.status}${txt ? ` (${txt.slice(0, 160)})` : ''}. ` +
+        '(API PHP à jour avec action=transmission_rpc ?)',
+    );
+  }
+  const data = (await res.json().catch(() => null)) as {
+    ok?: boolean;
+    error?: string;
+    status?: number;
+    sessionId?: string;
+    body?: string;
+  } | null;
+  if (!data || data.ok !== true) {
+    throw new TorrentUploadError(`Proxy Transmission : ${data?.error || 'réponse invalide'}.`);
+  }
+  const status = typeof data.status === 'number' ? data.status : 0;
+  const sessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+  const textBody = typeof data.body === 'string' ? data.body : '';
+  return {
+    status,
+    headers: { get: (name: string) => (name.toLowerCase() === 'x-transmission-session-id' ? sessionId || null : null) },
+    text: async () => textBody,
+    json: async () => JSON.parse(textBody || '{}') as unknown,
+  };
+}
+
 /**
  * POST RPC : requêtes natives via CapacitorHttp sur iOS/Android (pas de
  * CORS/preflight WebView — Transmission 4.1 ne répond plus les headers
  * CORS au OPTIONS, contrairement à la 4.0), fetch sinon.
+ * Sur page HTTPS + RPC http:// (mixed-content), bascule directe sur le proxy
+ * PHP même origine quand il est configuré, avec repli auto sur échec réseau.
  */
 async function rpcPost(headers: Record<string, string>, body?: string): Promise<RpcResponse> {
   if (Capacitor.isNativePlatform()) {
@@ -175,13 +266,36 @@ async function rpcPost(headers: Record<string, string>, body?: string): Promise<
       json: async () => JSON.parse(textBody || '{}') as unknown,
     };
   }
-  const res = await fetch(rpcURL(), { method: 'POST', headers, body });
-  return {
-    status: res.status,
-    headers: { get: (name: string) => res.headers.get(name) },
-    text: () => res.text(),
-    json: () => res.json(),
-  };
+  // Page HTTPS + RPC http:// : le navigateur bloquera le fetch direct.
+  // Passer d'emblée par le proxy PHP (même origine https) si configuré.
+  if (isMixedContentCase() && isProxyConfigured()) {
+    appLog('info', 'transmission', 'mixed-content https->http : bascule proxy PHP (transmission_rpc).');
+    return proxyRpcPost(headers, body);
+  }
+  try {
+    const res = await fetch(rpcURL(), { method: 'POST', headers, body });
+    return {
+      status: res.status,
+      headers: { get: (name: string) => res.headers.get(name) },
+      text: () => res.text(),
+      json: () => res.json(),
+    };
+  } catch (e) {
+    // Repli proxy : direct inaccessible (CORS / mixed-content / DNS filtré),
+    // le PHP relaie côté LAN. Seulement sur échec réseau, pas sur HTTP 4xx/5xx.
+    if (isProxyConfigured() && isNetworkFailure(e)) {
+      appLog('warn', 'transmission', 'direct injoignable, repli proxy PHP (transmission_rpc).');
+      return proxyRpcPost(headers, body);
+    }
+    if (isMixedContentCase() && !isProxyConfigured()) {
+      appLog('error', 'transmission', 'mixed-content https->http sans proxy configuré.');
+      throw new TorrentUploadError(
+        `Page HTTPS + RPC ${rpcURL()} en http:// : bloqué par le navigateur (mixed-content, « Failed to fetch »). ` +
+          'Configurez Réglages > Synchro vus avec une URL API en https même origine pour activer le proxy Transmission.',
+      );
+    }
+    throw e instanceof Error ? e : new Error(String(e));
+  }
 }
 
 /** Récupère un session-id valide (avec retry sur 409). */

@@ -49,6 +49,13 @@
       POST ?action=c411_download {url, apikey?} → {ok:true, status, data_base64}
         Cage stricte : https://c411.org uniquement (anti proxy ouvert).
         La clé C411 transite par requête (jamais stockée côté serveur).
+      Proxy Transmission (page HTTPS -> RPC http://, mixed-content navigateur) :
+      POST ?action=transmission_rpc {payload, sessionId?, authorization?|username?,password?}
+                                               → {ok:true, status, sessionId, body}
+        Cible : env TRANSMISSION_RPC_URL (défaut http://127.0.0.1:9091/transmission/rpc,
+        même hôte que Transmission). Méthodes autorisées : torrent-get/add/remove,
+        torrent-set-location, session-stats/get. Auth Transmission transmise par
+        requête (jamais stockée). Le token X-API-Token reste exigé (anti proxy ouvert).
 */
 declare(strict_types=1);
 
@@ -564,4 +571,130 @@ if ($action === 'c411_download') {
     out(['ok' => true, 'status' => $status, 'data_base64' => base64_encode($body)]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download).', 400);
+// ---------- Proxy Transmission (page HTTPS -> RPC http, anti mixed-content) ----------
+
+// Cible RPC côté serveur (pas de mixed-content côté PHP) : env docker
+// TRANSMISSION_RPC_URL, sinon même hôte sur le port 9091.
+function transmission_rpc_url(): string
+{
+    $env = getenv('TRANSMISSION_RPC_URL');
+    if (is_string($env) && trim($env) !== '') {
+        return trim($env);
+    }
+    return 'http://127.0.0.1:9091/transmission/rpc';
+}
+
+const TRANSMISSION_METHOD_ALLOW = [
+    'torrent-get',
+    'torrent-add',
+    'torrent-remove',
+    'torrent-set-location',
+    'session-stats',
+    'session-get',
+];
+
+/**
+ * POST JSON vers Transmission. Retourne [status HTTP, sessionId réponse, corps brut].
+ * Binaire-safe (corps non décodé ici, le client parse).
+ */
+function transmission_forward(string $url, string $jsonBody, string $auth, string $sessionId, int $timeout = 25): array
+{
+    $headers = ['Content-Type: application/json'];
+    if ($auth !== '') {
+        $headers[] = 'Authorization: ' . $auth;
+    }
+    if ($sessionId !== '') {
+        $headers[] = 'X-Transmission-Session-Id: ' . $sessionId;
+    }
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        $respSession = '';
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $jsonBody,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_HEADERFUNCTION => function ($ch, $h) use (&$respSession) {
+                $hl = strlen($h);
+                $pos = strpos($h, ':');
+                if ($pos !== false) {
+                    $name = strtolower(trim(substr($h, 0, $pos)));
+                    if ($name === 'x-transmission-session-id') {
+                        $respSession = trim(substr($h, $pos + 1));
+                    }
+                }
+                return $hl;
+            },
+        ]);
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = (string) curl_error($ch);
+        curl_close($ch);
+        if ($body === false) {
+            fail('Proxy Transmission : ' . ($err !== '' ? $err : 'échec requête') . ' (TRANSMISSION_RPC_URL=' . transmission_rpc_url() . ').', 502);
+        }
+        return [$status > 0 ? $status : 502, $respSession, (string) $body];
+    }
+    // Repli sans curl (allow_url_fopen requis).
+    $ctx = stream_context_create(['http' => [
+        'method' => 'POST',
+        'header' => implode("\r\n", $headers),
+        'content' => $jsonBody,
+        'timeout' => $timeout,
+        'ignore_errors' => true,
+    ]]);
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) {
+        fail('Proxy Transmission : requête impossible (curl absent ?).', 502);
+    }
+    $status = 0;
+    $respSession = '';
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $h, $m)) {
+            $status = (int) $m[1];
+        } elseif (preg_match('#^X-Transmission-Session-Id:\s*(.+?)\s*$#i', $h, $m)) {
+            $respSession = trim($m[1]);
+        }
+    }
+    return [$status > 0 ? $status : 200, $respSession, (string) $body];
+}
+
+if ($action === 'transmission_rpc') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $payload = $input['payload'] ?? null;
+    if (!is_array($payload)) {
+        fail('Champ payload manquant.', 400);
+    }
+    $method = (string) ($payload['method'] ?? '');
+    // Méthode vide = sonde initiale du handshake (le client POST sans corps
+    // pour récupérer le X-Transmission-Session-Id via 409) : on relaie tel quel.
+    if ($method !== '' && !in_array($method, TRANSMISSION_METHOD_ALLOW, true)) {
+        fail('Méthode Transmission non autorisée.', 403);
+    }
+    $sessionId = trim((string) ($input['sessionId'] ?? ''));
+    $auth = trim((string) ($input['authorization'] ?? ''));
+    if ($auth === '') {
+        $u = trim((string) ($input['username'] ?? ''));
+        $p = (string) ($input['password'] ?? '');
+        if ($u !== '' || $p !== '') {
+            $auth = 'Basic ' . base64_encode($u . ':' . $p);
+        }
+    }
+    if ($auth !== '' && !str_starts_with($auth, 'Basic ')) {
+        fail('Authorization invalide (Basic attendu).', 400);
+    }
+    [$status, $respSession, $respBody] = transmission_forward(
+        transmission_rpc_url(),
+        json_encode($payload, JSON_UNESCAPED_UNICODE) ?: '{}',
+        $auth,
+        $sessionId
+    );
+    out(['ok' => true, 'status' => $status, 'sessionId' => $respSession, 'body' => $respBody]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download, transmission_rpc).', 400);

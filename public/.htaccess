@@ -1,0 +1,10 @@
+# Fallback SPA : les routes Ionic (/download-manager/transmission, ...) doivent
+# retomber sur index.html au refresh / accès direct (sinon 404 Apache).
+# Déployé tel quel dans dist/ via public/.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /download-manager/
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /download-manager/index.html [L]
+</IfModule>

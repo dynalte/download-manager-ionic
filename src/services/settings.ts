@@ -215,7 +215,9 @@ export const settings = {
   /** URL de l'API perso de synchro des « déjà vu » (vide = synchro désactivée). */
   get seenSyncURL(): string {
     const stored = getString(Keys.seenSyncURL, '').trim().replace(/\/+$/, '');
-    return stored === '' ? 'http://photos2.dynaspirit.com:8080/api-download-manager.php' : stored;
+    // Défaut https même origine que l'app (évite le mixed-content depuis la
+    // page https://photos2.../download-manager/, qui bloque tout appel http://).
+    return stored === '' ? 'https://photos2.dynaspirit.com/api-download-manager.php' : stored;
   },
   /** Token partagé avec API_TOKEN côté PHP. Vide = synchro désactivée. */
   get seenSyncToken(): string {

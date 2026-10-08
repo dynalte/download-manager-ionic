@@ -68,7 +68,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
   const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-3.5-flash-lite');
   const [tmdbApiKey, setTmdbApiKey] = useStored(Keys.tmdbApiKey, '');
-  const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'http://photos2.dynaspirit.com:8080/api-download-manager.php');
+  const [seenSyncURL, setSeenSyncURL] = useStored(Keys.seenSyncURL, 'https://photos2.dynaspirit.com/api-download-manager.php');
   const [seenSyncToken, setSeenSyncToken] = useStored(Keys.seenSyncToken, '');
   const [seenCount, setSeenCount] = useState(0);
   const [syncTestMsg, setSyncTestMsg] = useState('');
@@ -213,7 +213,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             </IonLabel>
           </IonItem>
           <IonItem>
-            <IonInput label="URL API synchro" labelPlacement="stacked" value={seenSyncURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncURL(String(e.detail.value ?? ''))} placeholder="http://photos2.dynaspirit.com:8080/api-download-manager.php" />
+            <IonInput label="URL API synchro" labelPlacement="stacked" value={seenSyncURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncURL(String(e.detail.value ?? ''))} placeholder="https://photos2.dynaspirit.com/api-download-manager.php" />
           </IonItem>
           <IonItem>
             <IonInput label="Token synchro (même que API_TOKEN côté PHP)" labelPlacement="stacked" type="password" value={seenSyncToken} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setSeenSyncToken(String(e.detail.value ?? ''))} placeholder="..." />

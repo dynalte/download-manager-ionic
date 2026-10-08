@@ -251,8 +251,8 @@ const SeriesWatchTab: React.FC = () => {
 
   async function runCheckAll(silent = false) {
     const keys = activeSourceKeys();
-    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
-      if (!silent) setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) {
+      if (!silent) setToast('Colle ta clé API TR4KER, C411 ou V3X dans Réglages pour activer le suivi');
       return;
     }
     if (checking) return;
@@ -279,8 +279,8 @@ const SeriesWatchTab: React.FC = () => {
 
   async function runCheckOne(sub: SeriesSubscription) {
     const keys = activeSourceKeys();
-    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
-      setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) {
+      setToast('Colle ta clé API TR4KER, C411 ou V3X dans Réglages pour activer le suivi');
       return;
     }
     if (checking) return;
@@ -299,7 +299,7 @@ const SeriesWatchTab: React.FC = () => {
 
   async function forceOne(c: InspectCandidate) {
     const keys = activeSourceKeys();
-    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !inspecting || c.season === null || c.episode === null) return;
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) || !inspecting || c.season === null || c.episode === null) return;
     setForcingSlug(c.slug);
     try {
       const msg = await forceDownloadCandidate(
@@ -421,8 +421,8 @@ const SeriesWatchTab: React.FC = () => {
 
   async function openInspect(sub: SeriesSubscription) {
     const keys = activeSourceKeys();
-    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
-      setToast('Colle ta clé API TR4KER ou C411 dans Réglages pour activer le suivi');
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) {
+      setToast('Colle ta clé API TR4KER, C411 ou V3X dans Réglages pour activer le suivi');
       return;
     }
     setInspecting(sub);
@@ -452,7 +452,7 @@ const SeriesWatchTab: React.FC = () => {
     }
   }
 
-  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '';
+  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '' || settings.v3xApiKey !== '';
 
   return (
     <IonPage>
@@ -497,7 +497,7 @@ const SeriesWatchTab: React.FC = () => {
           <div style={{ padding: '12px 16px' }}>
             <IonText color="medium">
               <small>
-                Colle ta clé API TR4KER ou C411 dans Réglages pour activer la détection auto.
+                Colle ta clé API TR4KER, C411 ou V3X dans Réglages pour activer la détection auto.
               </small>
             </IonText>
           </div>
@@ -711,7 +711,7 @@ const SeriesWatchTab: React.FC = () => {
                   </IonText>
                   {inspectRes.candidates.length === 0 ? (
                     <p>
-                      <IonText color="warning">Aucun résultat (TR4KER/C411) pour cette requête (titre non indexé ou recherche trop large).</IonText>
+                      <IonText color="warning">Aucun résultat (TR4KER/C411/V3X) pour cette requête (titre non indexé ou recherche trop large).</IonText>
                     </p>
                   ) : (
                     <IonList>
@@ -727,7 +727,7 @@ const SeriesWatchTab: React.FC = () => {
                                 {c.season !== null ? `S${String(c.season).padStart(2, '0')}E${String(c.episode ?? 0).padStart(2, '0')}` : 'sans S/E'}
                               </IonBadge>{' '}
                               {c.isPack && <IonBadge color="tertiary">pack</IonBadge>}{' '}
-                              {c.source === 'c411' && <IonBadge color="secondary">C411</IonBadge>}{' '}
+                              {c.source === 'c411' && <IonBadge color="secondary">C411</IonBadge>}{' '}{c.source === 'v3x' && <IonBadge color="secondary">V3X</IonBadge>}{' '}
                               {!!c.quality && <IonBadge color="secondary">{c.quality}</IonBadge>}
                             </p>
                             <p style={{ whiteSpace: 'normal' }}>
@@ -777,7 +777,7 @@ const SeriesWatchTab: React.FC = () => {
 export async function runLaunchCheck(): Promise<void> {
   try {
     const keys = activeSourceKeys();
-    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !isGlobalCheckDue()) return;
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) || !isGlobalCheckDue()) return;
     if (loadSubscriptions().every((s) => !s.enabled)) return;
     await checkAllSubscriptions(keys);
     void pushAllSubscriptions();

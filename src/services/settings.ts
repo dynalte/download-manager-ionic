@@ -21,9 +21,12 @@ export const Keys = {
   fileServerPassword: 'file_server_password',
   tr4kerApiKey: 'tr4ker_api_key',
   c411ApiKey: 'c411_api_key',
+  v3xApiKey: 'v3x_api_key',
   tr4kerEnabled: 'tr4ker_enabled',
   c411Enabled: 'c411_enabled',
+  v3xEnabled: 'v3x_enabled',
   c411ProxyMode: 'c411_proxy_mode',
+  v3xProxyMode: 'v3x_proxy_mode',
   downloadNotificationsEnabled: 'download_notifications_enabled',
   downloadPollIntervalSeconds: 'download_poll_interval_seconds',
   plexMediaFilter: 'plex_media_filter',
@@ -177,6 +180,11 @@ export const settings = {
     const stored = getString(Keys.c411ApiKey, '').trim();
     return stored === '' ? AppConfig.c411ApiKey : stored;
   },
+  /** Clé API V3X (profil v3x.club, Réglages -> Intégrations). Vide = désactivé. */
+  get v3xApiKey(): string {
+    const stored = getString(Keys.v3xApiKey, '').trim();
+    return stored === '' ? AppConfig.v3xApiKey : stored;
+  },
   /** Source TR4KER active pour les recherches (défaut : oui). */
   get tr4kerEnabled(): boolean {
     return getBool(Keys.tr4kerEnabled, true);
@@ -185,9 +193,18 @@ export const settings = {
   get c411Enabled(): boolean {
     return getBool(Keys.c411Enabled, true);
   },
+  /** Source V3X active pour les recherches (défaut : oui). */
+  get v3xEnabled(): boolean {
+    return getBool(Keys.v3xEnabled, true);
+  },
   /** Mode d'accès C411 : proxy (défaut, via serveur PHP), direct, auto (direct + proxy en secours). */
   get c411ProxyMode(): C411ProxyMode {
     const v = getString(Keys.c411ProxyMode, 'proxy').trim();
+    return v === 'direct' || v === 'auto' ? v : 'proxy';
+  },
+  /** Mode d'accès V3X : mêmes modes que C411 (proxy par défaut). */
+  get v3xProxyMode(): C411ProxyMode {
+    const v = getString(Keys.v3xProxyMode, 'proxy').trim();
     return v === 'direct' || v === 'auto' ? v : 'proxy';
   },
   /** Clé API Google AI Studio pour les suggestions Gemini. Vide = désactivé. */

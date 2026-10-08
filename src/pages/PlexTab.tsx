@@ -23,7 +23,7 @@ import {
   IonAlert,
   RefresherEventDetail,
 } from '@ionic/react';
-import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, trashOutline } from 'ionicons/icons';
+import { settingsOutline, refreshOutline, playOutline, eyeOutline, gridOutline, filmOutline, notificationsOutline, sparklesOutline, trashOutline, globeOutline } from 'ionicons/icons';
 import { Capacitor } from '@capacitor/core';
 import { useHistory } from 'react-router-dom';
 import {
@@ -35,6 +35,7 @@ import {
   playOnPlayer,
   probeAndAddManualPlayer,
   removeManualPlayer as removeManualPlayerEntry,
+  resolvePlexWebURL,
   type PlexEpisodeItem,
   type PlexLibraryData,
   type PlexLibraryItem,
@@ -247,7 +248,7 @@ const PlexTab: React.FC = () => {
         ].join('\n'),
       );
       if (list.length === 0) {
-        setPlaybackMsg(`Aucun lecteur Plex detecte (${dbg}). Ouvre l’app Plex sur la Fire TV (même compte, même Wi-Fi) puis réessaie.`);
+        setPlaybackMsg(`Aucun lecteur Plex detecte (${dbg}). Ouvre l’app Plex sur la Fire TV (même compte, même Wi-Fi) puis réessaie — ou « Lire dans le navigateur » sur la fiche.`);
         return;
       }
       const online = list.filter((p) => p.presence === true).length;
@@ -271,6 +272,20 @@ const PlexTab: React.FC = () => {
       setPlaybackMsg(`Commande envoyee a ${player.name} — si rien ne démarre, vérifie que l’app Plex est ouverte sur la TV.`);
     } catch (e) {
       setPlaybackMsg(`Echec lecture sur ${player.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Repli sans lecteur distant : ouvre le média dans Plex Web (lecture navigateur). */
+  async function playInBrowser(item: PlexLibraryItem) {
+    setShowPlayerPicker(false);
+    setPlaybackMsg(`Ouverture de "${item.title}" dans Plex Web...`);
+    try {
+      const { url, title } = await resolvePlexWebURL(item, settings.plexResolvedBaseURL, settings.plexToken);
+      setPlaybackMsg(`Plex Web ouvert pour "${title}" (connecte ton compte Plex dans le navigateur si demandé).`);
+      requestBrowserOpen(url);
+      history.push('/browser');
+    } catch (e) {
+      setPlaybackMsg(`Plex Web impossible: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -683,6 +698,15 @@ const PlexTab: React.FC = () => {
                   <IonIcon icon={playOutline} slot="start" />
                   Lire sur Plex
                 </IonButton>
+                <IonButton
+                  expand="block"
+                  fill="outline"
+                  disabled={!detail}
+                  onClick={() => detail && void playInBrowser(detail)}
+                >
+                  <IonIcon icon={globeOutline} slot="start" />
+                  Lire dans le navigateur
+                </IonButton>
                 {detail && detail.type.toLowerCase() === 'show' && (
                   <IonButton expand="block" fill="outline" onClick={() => void subscribeShow(detail)}>
                     <IonIcon icon={notificationsOutline} slot="start" />
@@ -812,6 +836,9 @@ const PlexTab: React.FC = () => {
           }}
           onAddManual={(host, port) => void addManualPlayer(host, port)}
           onRemoveManual={handleRemoveManual}
+          onPlayInBrowser={() => {
+            if (selectedItem) void playInBrowser(selectedItem);
+          }}
           onCancel={() => setShowPlayerPicker(false)}
           onSelect={(player) => {
             setShowPlayerPicker(false);

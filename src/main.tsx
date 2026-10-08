@@ -30,6 +30,14 @@ setupIonicReact({ mode: 'ios' });
 applyTheme();
 watchSystemTheme();
 
+// PWA : service worker (contextes http(s) uniquement — pas sous file://
+// Electron ni capacitor:// natif, où l'enregistrement échouerait).
+if ('serviceWorker' in navigator && /^https?:$/.test(window.location.protocol)) {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+  });
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />

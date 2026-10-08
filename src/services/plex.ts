@@ -263,11 +263,12 @@ async function resolveServerContext(baseURLString: string, token: string): Promi
   const trimmed = baseURLString.trim();
   if (trimmed !== '') {
     const baseURL = normalizeBaseURL(trimmed);
-    if (!(await isPlexMediaServer(baseURL, token))) throw new PlexError('URL Plex invalide.');
-    const info = await fetchMachineIdentifier(baseURL, token);
+    if (!(await isPlexMediaServer(baseURL, token, CONN_PROBE_TIMEOUT_MS))) throw new PlexError('URL Plex invalide.');
+    const info = await fetchMachineIdentifier(baseURL, token, CONN_PROBE_TIMEOUT_MS);
     return { baseURL, machineIdentifier: info.machineIdentifier, version: info.version };
   }
-  // Cloud discovery via plex.tv
+  // Cloud discovery via plex.tv : premier répondant gagne (pas d'attente
+  // des connexions mortes en séquence).
   const devices = await fetchResourcesDevices(token);
   const servers = devices.filter((d) => {
     const provides = (d.getAttribute('provides') ?? '').toLowerCase();
@@ -275,17 +276,22 @@ async function resolveServerContext(baseURLString: string, token: string): Promi
     if (product.includes('media server')) return true;
     return provides.includes('server') && !provides.includes('player') && !provides.includes('client');
   });
+  const cached = lastGoodServerURL().trim();
+  const candidates: Array<{ url: string; machineId: string }> = [];
   for (const server of servers) {
-    for (const conn of deviceConnections(server)) {
-        try {
-          if (await isPlexMediaServer(conn.url, token)) {
-            const info = await fetchMachineIdentifier(conn.url, token);
-            return { baseURL: conn.url, machineIdentifier: info.machineIdentifier, version: info.version };
-          }
-        } catch {
-        /* essayer la connexion suivante */
-      }
-    }
+    const machineId = server.getAttribute('clientIdentifier') ?? '';
+    for (const conn of deviceConnections(server)) candidates.push({ url: conn.url, machineId });
+  }
+  candidates.sort((a, b) => (b.url === cached ? 1 : 0) - (a.url === cached ? 1 : 0));
+  const winnerURL = await firstWinningConn(
+    candidates.map((c) => c.url),
+    token,
+    CONN_PROBE_TIMEOUT_MS,
+  );
+  if (winnerURL) {
+    saveLastGoodServerURL(winnerURL);
+    const info = await fetchMachineIdentifier(winnerURL, token, CONN_PROBE_TIMEOUT_MS);
+    return { baseURL: winnerURL, machineIdentifier: info.machineIdentifier, version: info.version };
   }
   throw new PlexError('Aucun serveur Plex accessible trouve via le cloud.');
 }
@@ -296,11 +302,53 @@ async function resolveServerContext(baseURLString: string, token: string): Promi
  * sessions) et la commande relayée doivent toutes les essayer, comme
  * l'app officielle qui sonde chaque connexion publiée.
  *
- * Les sondes passent souvent par le relay plex.tv (lent) : timeout généreux
- * mais borné (30 s), et serveurs sondés en parallèle pour ne pas
- * additionner les latences.
+ * Les sondes ne cumulent plus les latences : premier répondant gagne
+ * (pas d'attente des connexions mortes), timeout réel 10 s par connexion,
+ * et dernière URL valide mémorisée (prioritaire à la prochaine détection).
  */
-const SERVER_PROBE_TIMEOUT_MS = 30000;
+const CONN_PROBE_TIMEOUT_MS = 10000;
+const LAST_SERVER_URL_KEY = 'plex_last_server_url';
+
+function lastGoodServerURL(): string {
+  try {
+    return localStorage.getItem(LAST_SERVER_URL_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveLastGoodServerURL(url: string): void {
+  try {
+    localStorage.setItem(LAST_SERVER_URL_KEY, url);
+  } catch {
+    /* stockage indisponible */
+  }
+}
+
+/** Première URL répondant comme PMS, sans attendre les connexions mortes. */
+async function firstWinningConn(urls: string[], token: string, timeoutMs: number): Promise<string | null> {
+  if (urls.length === 0) return null;
+  return new Promise((resolve) => {
+    let done = false;
+    let settled = 0;
+    for (const url of urls) {
+      void (async () => {
+        try {
+          if (await isPlexMediaServer(url, token, timeoutMs)) {
+            if (!done) {
+              done = true;
+              resolve(url);
+            }
+          }
+        } catch {
+          /* ignore : autre connexion tentée */
+        }
+        settled += 1;
+        if (settled === urls.length && !done) resolve(null);
+      })();
+    }
+  });
+}
 
 async function resolveAllServerContexts(
   baseURLString: string,
@@ -323,8 +371,8 @@ async function resolveAllServerContexts(
       (async () => {
         try {
           const baseURL = normalizeBaseURL(trimmed);
-          if (await isPlexMediaServer(baseURL, token, SERVER_PROBE_TIMEOUT_MS)) {
-            const info = await fetchMachineIdentifier(baseURL, token, SERVER_PROBE_TIMEOUT_MS).catch(() => ({
+          if (await isPlexMediaServer(baseURL, token, CONN_PROBE_TIMEOUT_MS)) {
+            const info = await fetchMachineIdentifier(baseURL, token, CONN_PROBE_TIMEOUT_MS).catch(() => ({
               machineIdentifier: '',
               version: '',
             }));
@@ -343,27 +391,24 @@ async function resolveAllServerContexts(
       if (product.includes('media server')) return true;
       return provides.includes('server') && !provides.includes('player') && !provides.includes('client');
     });
+    // Dernière URL valide connue d'abord (cas courant : elle répond en premier).
+    const cached = lastGoodServerURL().trim();
     await Promise.all(
       servers.map(async (server, si) => {
         const label = server.getAttribute('name') ?? 'serveur';
-        // Connexions sondées en parallèle (premier OK gagne) : un serveur mort
-        // (ex Mac mini éteint) ne doit pas coûter N × timeout en séquence.
+        // Premier répondant gagne : un serveur mort (ex Mac mini éteint,
+        // IPs docker périmées) ne retarde plus la détection.
         const conns = deviceConnections(server);
-        const winner = await Promise.all(
-          conns.map(async (conn) => {
-            try {
-              const ok = await Promise.race([
-                isPlexMediaServer(conn.url, token),
-                new Promise<boolean>((resolve) => setTimeout(() => resolve(false), SERVER_PROBE_TIMEOUT_MS)),
-              ]);
-              return ok ? conn : null;
-            } catch {
-              return null;
-            }
-          }),
-        ).then((rs) => rs.find((r): r is (typeof conns)[number] => !!r));
+        const ordered = [...conns].sort((a, b) => (b.url === cached ? 1 : 0) - (a.url === cached ? 1 : 0));
+        const winnerURL = await firstWinningConn(
+          ordered.map((c) => c.url),
+          token,
+          CONN_PROBE_TIMEOUT_MS,
+        );
+        const winner = winnerURL ? (ordered.find((c) => c.url === winnerURL) ?? null) : null;
         if (winner) {
-          const info = await fetchMachineIdentifier(winner.url, token, SERVER_PROBE_TIMEOUT_MS).catch(() => ({
+          saveLastGoodServerURL(winner.url);
+          const info = await fetchMachineIdentifier(winner.url, token, CONN_PROBE_TIMEOUT_MS).catch(() => ({
             machineIdentifier: server.getAttribute('clientIdentifier') ?? '',
             version: '',
           }));
@@ -1408,6 +1453,28 @@ export async function playOnPlayer(
         : ` • Pas d'adresse directe connue pour ce lecteur (ajoute sa IP via "Ajouter" : 192.168.1.x:32500)`) +
       ` Astuce Fire TV : ouvre l’app Plex sur la TV (même compte, même Wi-Fi), relance la détection, choisis le lecteur "en ligne".`,
   );
+}
+
+/** URL Plex Web (app.plex.tv) : lecture dans le navigateur, sans lecteur distant. */
+export function buildPlexWebURL(machineIdentifier: string, ratingKey: string): string {
+  return `https://app.plex.tv/desktop/#!/server/${encodeURIComponent(machineIdentifier)}/details?key=${encodeURIComponent(`/library/metadata/${ratingKey}`)}`;
+}
+
+/**
+ * Repli quand aucun lecteur distant n'est visible (/clients + sessions vides,
+ * TV éteinte ou autre compte) : ouvre le média dans Plex Web, qui lit
+ * directement depuis le serveur (séries -> épisode à lire résolu auto).
+ */
+export async function resolvePlexWebURL(
+  item: PlexLibraryItem,
+  baseURLString: string,
+  token: string,
+): Promise<{ url: string; title: string }> {
+  const ctxs = await resolveAllServerContexts(baseURLString, token);
+  if (ctxs.length === 0) throw new PlexError('Aucun serveur Plex joignable pour ouvrir Plex Web.');
+  const playable = await resolvePlayableItem(item, ctxs[0].baseURL, token);
+  if (!ctxs[0].machineIdentifier) throw new PlexError('Identifiant serveur Plex introuvable (recharge les bibliothèques).');
+  return { url: buildPlexWebURL(ctxs[0].machineIdentifier, playable.ratingKey), title: playable.title };
 }
 
 export { attr };

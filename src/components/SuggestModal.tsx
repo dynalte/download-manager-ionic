@@ -87,7 +87,7 @@ interface Props {
 /**
  * Modale Suggestions IA (Gemini) partagée entre les onglets Plex et Catalogue :
  * recommandations absentes de la librairie Plex, pistes de suivi, liens
-  * Allociné / téléchargement (TR4KER + C411) → Transmission, ajout aux suivis, marquage « déjà vu ».
+  * Allociné / téléchargement (TR4KER + C411 + V3X) → Transmission, ajout aux suivis, marquage « déjà vu ».
  */
 const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const history = useHistory();
@@ -109,7 +109,7 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [suggestRatingsMap, setSuggestRatingsMap] = useState<Record<string, AllocineRatings>>({});
   const suggestRatingsMapRef = useRef<Record<string, AllocineRatings>>({});
   const suggestRatingsReq = useRef(0);
-  /** Torrents trouvés par suggestion (TR4KER + C411, index -> résultats). */
+  /** Torrents trouvés par suggestion (TR4KER + C411 + V3X, index -> résultats). */
   const [dlResults, setDlResults] = useState<Record<number, DiscoveryFilm[]>>({});
   const [dlLoading, setDlLoading] = useState<number | null>(null);
   const [dlError, setDlError] = useState<Record<number, string>>({});
@@ -302,7 +302,7 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
     return () => window.clearTimeout(stagger);
   }, [suggestions]);
 
-  /** Recherche les torrents d'une suggestion (TR4KER + C411 fusionnés). */
+  /** Recherche les torrents d'une suggestion (TR4KER + C411 + V3X fusionnés). */
   async function searchTorrentsFor(rec: GeminiRecommendation, index: number) {
     // Repli : referme si déjà affiché.
     if (dlResults[index] !== undefined && dlLoading !== index) {
@@ -314,8 +314,8 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
       return;
     }
     const keys = activeSourceKeys();
-    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
-      setDlError((prev) => ({ ...prev, [index]: 'Clé API TR4KER ou C411 manquante : ajoute-la dans Réglages.' }));
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) {
+      setDlError((prev) => ({ ...prev, [index]: 'Clé API TR4KER, C411 ou V3X manquante : ajoute-la dans Réglages.' }));
       return;
     }
     setDlLoading(index);
@@ -398,8 +398,8 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
   async function sendSuggestionTorrent(film: DiscoveryFilm, rec: GeminiRecommendation) {
     if (sendingSlug) return;
     const keys = activeSourceKeys();
-    if (!keys.tr4kerApiKey && !keys.c411ApiKey) {
-      setDlMsg('Clé API TR4KER ou C411 manquante (Réglages).');
+    if (!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) {
+      setDlMsg('Clé API TR4KER, C411 ou V3X manquante (Réglages).');
       return;
     }
     setSendingSlug(film.slug);
@@ -601,7 +601,7 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
                   {dlLoading === i && (
                     <div style={{ padding: '8px 0' }}>
                       <IonSpinner style={{ width: 18, height: 18 }} />
-                      <IonText color="medium"> Recherche TR4KER + C411...</IonText>
+                      <IonText color="medium"> Recherche TR4KER + C411 + V3X...</IonText>
                     </div>
                   )}
                   {!!dlError[i] && (
@@ -618,7 +618,7 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
                     <div style={{ marginTop: 4 }}>
                       {dlResults[i].length === 0 ? (
                         <p style={{ whiteSpace: 'normal' }}>
-                          <IonText color="medium">Aucun torrent trouvé (TR4KER + C411) pour ce titre.</IonText>
+                          <IonText color="medium">Aucun torrent trouvé (TR4KER + C411 + V3X) pour ce titre.</IonText>
                         </p>
                       ) : (
                         dlResults[i].slice(0, 8).map((f) => (
@@ -632,7 +632,7 @@ const SuggestModal: React.FC<Props> = ({ isOpen, onClose }) => {
                                 <small>
                                   {formatBytes(f.sizeBytes)} • {f.seeders} seeders
                                   {f.isFreeleech ? ' • Freeleech' : ''}
-                                  {f.source === 'c411' ? ' • C411' : ''}
+                                  {f.source === 'c411' ? ' • C411' : f.source === 'v3x' ? ' • V3X' : ''}
                                 </small>
                               </IonText>
                             </div>

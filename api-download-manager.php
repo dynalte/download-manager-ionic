@@ -46,10 +46,24 @@
       AdGuard/VPN, CORS du navigateur dev, maintenance vue côté client) :
       POST ?action=c411_search {apikey, t?, q?, cat?, limit?, season?, ep?, imdbid?, tmdbid?}
                                                → {ok:true, status, xml} (Torznab brut)
-      POST ?action=c411_download {url, apikey?} → {ok:true, status, data_base64}
-        Cage stricte : https://c411.org uniquement (anti proxy ouvert).
-        La clé C411 transite par requête (jamais stockée côté serveur).
-      Proxy Transmission (page HTTPS -> RPC http://, mixed-content navigateur) :
+       POST ?action=c411_download {url, apikey?} → {ok:true, status, data_base64}
+         Cage stricte : https://c411.org uniquement (anti proxy ouvert).
+         La clé C411 transite par requête (jamais stockée côté serveur).
+       Fiche C411 (synopsis + specs, l'accès direct client est filtré 403) :
+       POST ?action=c411_detail {url, apikey?}  → {ok:true, status, html}
+         Cage stricte : https://c411.org uniquement.
+       Proxy V3X (v3x.club, même motif que C411 : API JSON indexer/search) :
+       POST ?action=v3x_search {apikey, q?, cat?, limit?, tmdbid?, season?, ep?}
+                                                → {ok:true, status, json} (brut)
+       POST ?action=v3x_download {url, apikey?} → {ok:true, status, data_base64}
+       POST ?action=v3x_detail {url, apikey?}   → {ok:true, status, html}
+         Cage stricte : https://*.v3x.club et https://*.v3x.tw (anti proxy ouvert).
+         La clé V3X transite par requête (jamais stockée côté serveur).
+       Notes Allociné (le web est bloqué par le CORS, le natif parfois par
+       l'anti-bot DataDome : le serveur fait autocomplete + fiche SSR) :
+       POST ?action=allocine_ratings {query, year?}
+                                                → {ok:true, ratings:{...}|null}
+       Proxy Transmission (page HTTPS -> RPC http://, mixed-content navigateur) :
       POST ?action=transmission_rpc {payload, sessionId?, authorization?|username?,password?}
                                                → {ok:true, status, sessionId, body}
         Cible : env TRANSMISSION_RPC_URL (défaut http://127.0.0.1:9091/transmission/rpc,
@@ -412,9 +426,12 @@ const CONFIG_KEYS = [
     'file_server_password',
     'tr4ker_api_key',
     'c411_api_key',
+    'v3x_api_key',
     'tr4ker_enabled',
     'c411_enabled',
+    'v3x_enabled',
     'c411_proxy_mode',
+    'v3x_proxy_mode',
     'gemini_api_key',
     'gemini_model',
     'tmdb_api_key',
@@ -571,6 +588,382 @@ if ($action === 'c411_download') {
     out(['ok' => true, 'status' => $status, 'data_base64' => base64_encode($body)]);
 }
 
+// ---------- Fiche C411 (synopsis + détails techniques) ----------
+
+if ($action === 'c411_detail') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $url = trim((string) ($input['url'] ?? ''));
+    $parts = parse_url($url);
+    if (!is_array($parts) || strtolower((string) ($parts['host'] ?? '')) !== 'c411.org') {
+        fail('URL non autorisée (https://c411.org uniquement).', 403);
+    }
+    if (strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        && strtolower((string) ($parts['scheme'] ?? '')) !== 'http') {
+        fail('URL non autorisée (https://c411.org uniquement).', 403);
+    }
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey !== '' && !preg_match('/[?&]apikey=/i', $url)) {
+        $url .= (str_contains($url, '?') ? '&' : '?') . 'apikey=' . urlencode($apikey);
+    }
+    [$status, $body] = c411_fetch($url, 25);
+    out(['ok' => true, 'status' => $status, 'html' => $body]);
+}
+
+// ---------- Proxy V3X (recherche JSON + téléchargement .torrent + fiche) ----------
+
+/**
+ * GET distant vers V3X (recherche JSON comme .torrent binaire ou fiche HTML).
+ * Retourne [status HTTP, corps]. Binaire-safe (pas de conversion).
+ */
+function v3x_fetch(string $url, int $timeout = 25): array
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_USERAGENT => 'DownloadManager-PHP-Proxy/1.0',
+            CURLOPT_HTTPHEADER => ['Accept: application/json,text/html,*/*'],
+        ]);
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = (string) curl_error($ch);
+        curl_close($ch);
+        if ($body === false) {
+            fail('Proxy V3X : ' . ($err !== '' ? $err : 'échec requête') . '.', 502);
+        }
+        return [$status > 0 ? $status : 502, (string) $body];
+    }
+    // Repli sans curl (allow_url_fopen requis).
+    $ctx = stream_context_create(['http' => [
+        'timeout' => $timeout,
+        'header' => 'User-Agent: DownloadManager-PHP-Proxy/1.0',
+        'ignore_errors' => true,
+    ]]);
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) {
+        fail('Proxy V3X : requête impossible (curl absent ?).', 502);
+    }
+    $status = 0;
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $h, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    return [$status > 0 ? $status : 200, (string) $body];
+}
+
+/** Cage anti proxy ouvert : hôtes V3X uniquement (api + site + miroir .tw). */
+function v3x_check_url(string $url): void
+{
+    $parts = parse_url($url);
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+    if (($scheme !== 'https' && $scheme !== 'http')
+        || !preg_match('/(^|\.)v3x\.(club|tw)$/', $host)) {
+        fail('URL non autorisée (hôtes v3x.club / v3x.tw uniquement).', 403);
+    }
+}
+
+if ($action === 'v3x_search') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey === '') {
+        fail('Clé API V3X manquante.', 400);
+    }
+    $params = ['apikey' => $apikey];
+    foreach (['q', 'cat', 'limit', 'tmdbid', 'season', 'ep'] as $k) {
+        $v = trim((string) ($input[$k] ?? ''));
+        if ($v !== '') {
+            $params[$k] = $v;
+        }
+    }
+    if (isset($params['limit'])) {
+        $params['limit'] = (string) min(100, max(1, (int) $params['limit']));
+    }
+    [$status, $body] = v3x_fetch('https://api.v3x.club/indexer/search?' . http_build_query($params));
+    out(['ok' => true, 'status' => $status, 'json' => $body]);
+}
+
+if ($action === 'v3x_download') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $url = trim((string) ($input['url'] ?? ''));
+    v3x_check_url($url);
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey !== '' && !preg_match('/[?&]apikey=/i', $url)) {
+        $url .= (str_contains($url, '?') ? '&' : '?') . 'apikey=' . urlencode($apikey);
+    }
+    [$status, $body] = v3x_fetch($url, 60);
+    if ($status < 200 || $status >= 300 || $body === '') {
+        out(['ok' => true, 'status' => $status, 'data_base64' => '']);
+    }
+    out(['ok' => true, 'status' => $status, 'data_base64' => base64_encode($body)]);
+}
+
+if ($action === 'v3x_detail') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $url = trim((string) ($input['url'] ?? ''));
+    v3x_check_url($url);
+    $apikey = trim((string) ($input['apikey'] ?? ''));
+    if ($apikey !== '' && !preg_match('/[?&]apikey=/i', $url)) {
+        $url .= (str_contains($url, '?') ? '&' : '?') . 'apikey=' . urlencode($apikey);
+    }
+    [$status, $body] = v3x_fetch($url, 25);
+    out(['ok' => true, 'status' => $status, 'html' => $body]);
+}
+
+// ---------- Notes Allociné via le serveur (repli web / anti-bot) ----------
+
+/** GET texte distant avec UA navigateur (Allociné filtre les bots). */
+function allocine_fetch(string $url, int $timeout = 15): array
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+            CURLOPT_HTTPHEADER => ['Accept: text/html,application/json', 'Accept-Language: fr-FR,fr;q=0.9'],
+            CURLOPT_ENCODING => '',
+        ]);
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = (string) curl_error($ch);
+        curl_close($ch);
+        if ($body === false) {
+            fail('Proxy Allociné : ' . ($err !== '' ? $err : 'échec requête') . '.', 502);
+        }
+        return [$status > 0 ? $status : 502, (string) $body];
+    }
+    $ctx = stream_context_create(['http' => [
+        'timeout' => $timeout,
+        'header' => "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nAccept-Language: fr-FR,fr;q=0.9",
+        'ignore_errors' => true,
+    ]]);
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) {
+        fail('Proxy Allociné : requête impossible (curl absent ?).', 502);
+    }
+    $status = 0;
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $h, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    return [$status > 0 ? $status : 200, (string) $body];
+}
+
+function allocine_norm(string $s): string
+{
+    $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $s);
+    $s = $t === false ? $s : $t;
+    $s = strtolower($s);
+    $s = preg_replace('/[^a-z0-9]+/', ' ', $s) ?? '';
+    return trim($s);
+}
+
+function allocine_parse_note($raw): ?float
+{
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+    $v = (float) str_replace(',', '.', (string) $raw);
+    if (!is_finite($v) || $v < 0 || $v > 5) {
+        return null;
+    }
+    return round($v * 10) / 10;
+}
+
+function allocine_parse_votes($txt): ?int
+{
+    if (!preg_match('/([\d\s]+)/', (string) $txt, $m)) {
+        return null;
+    }
+    $n = (int) str_replace(' ', '', $m[1]);
+    return $n >= 0 ? $n : null;
+}
+
+function allocine_meta_content(string $html, string $property): ?string
+{
+    $q = preg_quote($property, '/');
+    if (preg_match('/<meta[^>]+property=["\']' . $q . '["\'][^>]+content=["\']([^"\']+)["\']/i', $html, $m)) {
+        return trim($m[1]);
+    }
+    if (preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']' . $q . '["\']/i', $html, $m)) {
+        return trim($m[1]);
+    }
+    return null;
+}
+
+function allocine_clean_synopsis(string $s): ?string
+{
+    $txt = trim(preg_replace('/\s+/', ' ', html_entity_decode($s, ENT_QUOTES | ENT_HTML5, 'UTF-8')) ?? '');
+    if (strlen($txt) < 40) {
+        return null;
+    }
+    if (preg_match('/allocin[ée].*(bandes-annonces|cinéma|films à l\'affiche|séries du moment)/i', $txt)) {
+        return null;
+    }
+    return $txt;
+}
+
+if ($action === 'allocine_ratings') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $query = trim((string) ($input['query'] ?? ''));
+    $year = trim((string) ($input['year'] ?? ''));
+    if ($query === '') {
+        fail('Requête vide.', 400);
+    }
+    [$acStatus, $acBody] = allocine_fetch('https://www.allocine.fr/_/autocomplete/' . rawurlencode($query), 12);
+    if ($acStatus < 200 || $acStatus >= 300) {
+        out(['ok' => true, 'ratings' => null]);
+    }
+    $ac = json_decode($acBody, true);
+    $cands = [];
+    foreach ((is_array($ac) ? ($ac['results'] ?? []) : []) as $r) {
+        if (is_array($r) && isset($r['entity_type']) && ($r['entity_type'] === 'movie' || $r['entity_type'] === 'series')) {
+            $cands[] = $r;
+        }
+    }
+    if (count($cands) === 0) {
+        out(['ok' => true, 'ratings' => null]);
+    }
+    // Meilleur candidat : ressemblance titre + bonus millésime.
+    $q = allocine_norm($query);
+    $best = null;
+    $bestScore = 0;
+    foreach ($cands as $r) {
+        $labels = array_filter([allocine_norm((string) ($r['label'] ?? '')), allocine_norm((string) ($r['original_label'] ?? ''))]);
+        $t = 0;
+        foreach ($labels as $n) {
+            $s = 0;
+            if ($n !== '' && $q !== '' && $n === $q) {
+                $s = 100;
+            } elseif ($n !== '' && $q !== '' && (str_starts_with($n, $q) || str_starts_with($q, $n))) {
+                $s = 60;
+            } elseif ($n !== '' && $q !== '' && (str_contains($n, $q) || str_contains($q, $n))) {
+                $s = 30;
+            }
+            if ($s > $t) {
+                $t = $s;
+            }
+        }
+        if ($year !== '' && isset($r['data']['year']) && (string) $r['data']['year'] === $year) {
+            $t += 25;
+        }
+        if ($t > $bestScore) {
+            $bestScore = $t;
+            $best = $r;
+        }
+    }
+    if ($best === null) {
+        $best = $cands[0];
+        if ($year !== '') {
+            foreach ($cands as $r) {
+                if (isset($r['data']['year']) && (string) $r['data']['year'] === $year) {
+                    $best = $r;
+                    break;
+                }
+            }
+        }
+    }
+    $id = $best['entity_id'] ?? null;
+    if ($id === null || $id === '') {
+        out(['ok' => true, 'ratings' => null]);
+    }
+    $pageUrl = ($best['entity_type'] === 'series')
+        ? ('https://www.allocine.fr/series/ficheserie_gen_cserie=' . urlencode((string) $id) . '.html')
+        : ('https://www.allocine.fr/film/fichefilm_gen_cfilm=' . urlencode((string) $id) . '.html');
+    [$htmlStatus, $html] = allocine_fetch($pageUrl, 15);
+    if ($htmlStatus < 200 || $htmlStatus >= 300 || $html === '') {
+        out(['ok' => true, 'ratings' => null]);
+    }
+    $press = null;
+    $pressReviews = null;
+    $spectators = null;
+    $votes = null;
+    if (preg_match_all('/stareval-small[\s\S]{0,500}?stareval-note">([^<]+)<\/span><span class="stareval-review light">\s*([^<]*)/', $html, $mm, PREG_SET_ORDER)) {
+        foreach ($mm as $m) {
+            $val = allocine_parse_note(trim($m[1] ?? ''));
+            $txt = trim($m[2] ?? '');
+            if ($val === null) {
+                continue;
+            }
+            if (stripos($txt, 'notes') !== false) {
+                if ($spectators === null) {
+                    $spectators = $val;
+                    $votes = allocine_parse_votes($txt);
+                }
+            } elseif (stripos($txt, 'critiques') !== false) {
+                if ($press === null) {
+                    $press = $val;
+                    $pressReviews = allocine_parse_votes($txt);
+                }
+            }
+            if ($press !== null && $spectators !== null) {
+                break;
+            }
+        }
+    }
+    if ($spectators === null && preg_match('/"aggregateRating"\s*:\s*\{[^}]*"ratingValue"\s*:\s*"([\d.]+)"[^}]*"ratingCount"\s*:\s*"(\d+)"/', $html, $ld)) {
+        $spectators = allocine_parse_note($ld[1]);
+        $n = (int) $ld[2];
+        $votes = $n >= 0 ? $n : null;
+    }
+    $posterURL = allocine_meta_content($html, 'og:image');
+    if ($posterURL !== null && (!preg_match('#^https?://#i', $posterURL) || stripos($posterURL, 'logo') !== false)) {
+        $posterURL = null;
+    }
+    $synopsis = null;
+    if (preg_match('/"description"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"/', $html, $ld)) {
+        $decoded = json_decode('"' . $ld[1] . '"');
+        if (is_string($decoded)) {
+            $synopsis = allocine_clean_synopsis($decoded);
+        }
+    }
+    if ($synopsis === null) {
+        $og = allocine_meta_content($html, 'og:description');
+        if ($og !== null) {
+            $synopsis = allocine_clean_synopsis($og);
+        }
+    }
+    if ($press === null && $spectators === null && $posterURL === null && $synopsis === null) {
+        out(['ok' => true, 'ratings' => null]);
+    }
+    out(['ok' => true, 'ratings' => [
+        'title' => (string) ($best['label'] ?? $best['original_label'] ?? ''),
+        'year' => (string) ($best['data']['year'] ?? ''),
+        'url' => $pageUrl,
+        'press' => $press,
+        'pressReviews' => $pressReviews,
+        'spectators' => $spectators,
+        'votes' => $votes,
+        'posterURL' => $posterURL,
+        'synopsis' => $synopsis,
+    ]]);
+}
+
 // ---------- Proxy Transmission (page HTTPS -> RPC http, anti mixed-content) ----------
 
 // Cible RPC côté serveur (pas de mixed-content côté PHP) : env docker
@@ -697,4 +1090,4 @@ if ($action === 'transmission_rpc') {
     out(['ok' => true, 'status' => $status, 'sessionId' => $respSession, 'body' => $respBody]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download, transmission_rpc).', 400);
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download, c411_detail, allocine_ratings, v3x_search, v3x_download, v3x_detail, transmission_rpc).', 400);

@@ -11,6 +11,22 @@ import FilmsTab from './pages/FilmsTab';
 import BrowserTab from './pages/BrowserTab';
 import SeriesWatchTab, { runLaunchCheck } from './pages/SeriesWatchTab';
 
+/**
+ * Base du routeur selon l'hébergement : la PWA est servie sous
+ * /download-manager/ (sans rewrite serveur), donc les routes /films…
+ * ne matcheraient jamais sans basename. Natif (capacitor://) et Electron
+ * (file://) gardent une base vide (comportement inchangé).
+ */
+function routerBasename(): string | undefined {
+  try {
+    const p = window.location.protocol;
+    if (p !== 'http:' && p !== 'https:') return undefined;
+    return /^\/download-manager(\/|$)/.test(window.location.pathname) ? '/download-manager' : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const App: React.FC = () => {
   // Suivi de séries : vérification silencieuse au lancement (throttle 6 h).
   useEffect(() => {
@@ -18,7 +34,7 @@ const App: React.FC = () => {
   }, []);
   return (
     <IonApp>
-      <IonReactRouter>
+      <IonReactRouter basename={routerBasename()}>
         <IonTabs>
           <IonRouterOutlet>
             <Route exact path="/films">

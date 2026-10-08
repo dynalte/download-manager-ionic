@@ -33,6 +33,7 @@ import { loadSeenSuggestions } from '../services/seenSuggestions';
 import { clearSeenEverywhere } from '../services/seenSync';
 import { testServerConnection } from '../services/serverApi';
 import { testC411Connection } from '../services/c411';
+import { testV3XConnection } from '../services/v3x';
 import { testTmdbConnection } from '../services/tmdb';
 import { requestBrowserOpen } from '../services/browserNavigation';
 import { applyRemoteConfig, fetchRemoteConfig, pushRemoteConfig } from '../services/remoteConfig';
@@ -65,6 +66,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [fileServerPass, setFileServerPass] = useStored(Keys.fileServerPassword, AppConfig.fileServerPassword);
   const [tr4kerApiKey, setTr4kerApiKey] = useStored(Keys.tr4kerApiKey, AppConfig.tr4kerApiKey);
   const [c411ApiKey, setC411ApiKey] = useStored(Keys.c411ApiKey, AppConfig.c411ApiKey);
+  const [v3xApiKey, setV3xApiKey] = useStored(Keys.v3xApiKey, AppConfig.v3xApiKey);
   const [geminiApiKey, setGeminiApiKey] = useStored(Keys.geminiApiKey, '');
   const [geminiModelRaw, setGeminiModel] = useStored(Keys.geminiModel, 'gemini-3.5-flash-lite');
   const [tmdbApiKey, setTmdbApiKey] = useStored(Keys.tmdbApiKey, '');
@@ -75,10 +77,16 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [syncTesting, setSyncTesting] = useState(false);
   const [c411TestMsg, setC411TestMsg] = useState('');
   const [c411Testing, setC411Testing] = useState(false);
+  const [v3xTestMsg, setV3xTestMsg] = useState('');
+  const [v3xTesting, setV3xTesting] = useState(false);
   const [tmdbTestMsg, setTmdbTestMsg] = useState('');
   const [tmdbTesting, setTmdbTesting] = useState(false);
   const [c411ProxyMode, setC411ProxyModeState] = useState<C411ProxyMode>(() => {
     const v = localStorage.getItem(Keys.c411ProxyMode) ?? 'proxy';
+    return v === 'direct' || v === 'auto' ? v : 'proxy';
+  });
+  const [v3xProxyMode, setV3xProxyModeState] = useState<C411ProxyMode>(() => {
+    const v = localStorage.getItem(Keys.v3xProxyMode) ?? 'proxy';
     return v === 'direct' || v === 'auto' ? v : 'proxy';
   });
   const [syncPullMsg, setSyncPullMsg] = useState('');
@@ -104,6 +112,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
     str(Keys.fileServerPassword, setFileServerPass);
     str(Keys.tr4kerApiKey, setTr4kerApiKey);
     str(Keys.c411ApiKey, setC411ApiKey);
+    str(Keys.v3xApiKey, setV3xApiKey);
     str(Keys.geminiApiKey, setGeminiApiKey);
     str(Keys.geminiModel, setGeminiModel);
     str(Keys.tmdbApiKey, setTmdbApiKey);
@@ -125,11 +134,22 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       setC411EnabledState(on);
       setSetting(Keys.c411Enabled, on ? '1' : '0');
     }
+    if (cfg[Keys.v3xEnabled] !== undefined) {
+      const on = cfg[Keys.v3xEnabled] === '1' || cfg[Keys.v3xEnabled] === 'true';
+      setV3xEnabledState(on);
+      setSetting(Keys.v3xEnabled, on ? '1' : '0');
+    }
     if (cfg[Keys.c411ProxyMode] !== undefined) {
       const m = cfg[Keys.c411ProxyMode];
       const mode: C411ProxyMode = m === 'direct' || m === 'auto' ? m : 'proxy';
       setC411ProxyModeState(mode);
       setSetting(Keys.c411ProxyMode, mode);
+    }
+    if (cfg[Keys.v3xProxyMode] !== undefined) {
+      const m = cfg[Keys.v3xProxyMode];
+      const mode: C411ProxyMode = m === 'direct' || m === 'auto' ? m : 'proxy';
+      setV3xProxyModeState(mode);
+      setSetting(Keys.v3xProxyMode, mode);
     }
     if (cfg[Keys.downloadNotificationsEnabled] !== undefined) {
       const on = cfg[Keys.downloadNotificationsEnabled] !== '0' && cfg[Keys.downloadNotificationsEnabled] !== 'false';
@@ -186,6 +206,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [plexUseCloud, setPlexUseCloudState] = useState(() => (localStorage.getItem(Keys.plexUseCloud) ?? '') === '1');
   const [tr4kerEnabled, setTr4kerEnabledState] = useState(() => (localStorage.getItem(Keys.tr4kerEnabled) ?? '1') !== '0');
   const [c411Enabled, setC411EnabledState] = useState(() => (localStorage.getItem(Keys.c411Enabled) ?? '1') !== '0');
+  const [v3xEnabled, setV3xEnabledState] = useState(() => (localStorage.getItem(Keys.v3xEnabled) ?? '1') !== '0');
   const [notificationsEnabled, setNotificationsEnabledState] = useState(
     () => (localStorage.getItem(Keys.downloadNotificationsEnabled) ?? '1') !== '0',
   );
@@ -408,6 +429,87 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
                 const mode: C411ProxyMode = v === 'direct' || v === 'auto' ? v : 'proxy';
                 setC411ProxyModeState(mode);
                 setSetting(Keys.c411ProxyMode, mode);
+              }}
+            >
+              <IonSegmentButton value="proxy">
+                <IonLabel>Proxy</IonLabel>
+              </IonSegmentButton>
+              <IonSegmentButton value="auto">
+                <IonLabel>Auto</IonLabel>
+              </IonSegmentButton>
+              <IonSegmentButton value="direct">
+                <IonLabel>Direct</IonLabel>
+              </IonSegmentButton>
+            </IonSegment>
+          </div>
+
+          <IonItem>
+            <IonLabel>
+              <h2>Catalogue torrent (V3X)</h2>
+              <p>Clé « Intégrations » du profil v3x.club (scope torznab). Recherche Catalogue + Suggestions + Suivis, en plus de TR4KER et C411.</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              onClick={() => {
+                requestBrowserOpen('https://v3x.club/');
+                onClose();
+              }}
+            >
+              Ouvrir V3X
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonInput label="Clé API V3X" labelPlacement="stacked" type="password" value={v3xApiKey} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setV3xApiKey(String(e.detail.value ?? ''))} />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Utiliser V3X pour les recherches et le suivi</p>
+            </IonLabel>
+            <IonToggle
+              slot="end"
+              checked={v3xEnabled}
+              onIonChange={(e) => {
+                setV3xEnabledState(e.detail.checked);
+                setSetting(Keys.v3xEnabled, e.detail.checked ? '1' : '0');
+              }}
+            />
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>{v3xTestMsg || 'Vérifie la connexion au tracker et la validité de la clé.'}</p>
+            </IonLabel>
+            <IonButton
+              slot="end"
+              size="small"
+              fill="outline"
+              disabled={v3xTesting}
+              onClick={() => {
+                setV3xTesting(true);
+                setV3xTestMsg('');
+                void testV3XConnection(v3xApiKey)
+                  .then((msg) => setV3xTestMsg(msg))
+                  .catch((e) => setV3xTestMsg(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setV3xTesting(false));
+              }}
+            >
+              {v3xTesting ? 'Test…' : 'Tester'}
+            </IonButton>
+          </IonItem>
+          <IonItem>
+            <IonLabel>
+              <p>Accès V3X : proxy = tout passe par le serveur PHP (recommandé, contourne le blocage direct).</p>
+            </IonLabel>
+          </IonItem>
+          <div style={{ padding: '0 16px 8px' }}>
+            <IonSegment
+              value={v3xProxyMode}
+              onIonChange={(e) => {
+                const v = String(e.detail.value);
+                const mode: C411ProxyMode = v === 'direct' || v === 'auto' ? v : 'proxy';
+                setV3xProxyModeState(mode);
+                setSetting(Keys.v3xProxyMode, mode);
               }}
             >
               <IonSegmentButton value="proxy">

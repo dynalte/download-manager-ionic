@@ -1,15 +1,18 @@
 /**
- * Notes Allociné automatiques (exe Windows + natif mobile).
+ * Notes Allociné automatiques (exe Windows + natif mobile + proxy serveur).
  * - Exe : le processus main interroge l'autocomplete public + la fiche
  *   SSR (pas de CORS côté main) avec cache 30 jours.
  * - iOS/Android : même chaîne via CapacitorHttp (requêtes natives
  *   URLSession/OkHttp, non soumises au CORS de la WebView qui bloque
  *   fetch vers allocine.fr) avec cache mémoire + Preferences 30 jours.
- * - Web : indisponible (CORS), retourne null.
+ * - Web / repli anti-bot : le serveur PHP perso fait le scraping
+ *   (action allocine_ratings) quand il est configuré, car le navigateur
+ *   est bloqué par le CORS et DataDome bloque parfois aussi le natif.
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Preferences } from '@capacitor/preferences';
 import { buildAllocineQuery } from './torrentScripts';
+import { isServerConfigured, serverApi } from './serverApi';
 
 export interface AllocineRatings {
   title: string;
@@ -319,15 +322,63 @@ export async function fetchAllocineRatings(rawTitle: string, year?: number | str
     }
   }
   // 2) Natif mobile : même chaîne via requêtes natives (pas de CORS).
+  // En cas d'échec (DataDome 403), repli proxy serveur ci-dessous.
   if (Capacitor.isNativePlatform()) {
     try {
-      return await nativeAllocineRatings(query, year);
+      const r = await nativeAllocineRatings(query, year);
+      if (r && (r.press != null || r.spectators != null || r.posterURL != null || r.synopsis != null)) return r;
     } catch {
-      return null;
+      /* repli proxy */
     }
   }
-  // 3) Web : CORS bloque allocine.fr.
+  // 3) Proxy PHP (web CORS + repli anti-bot natif) : autocomplete + fiche
+  // SSR côté serveur, action allocine_ratings (nécessite la synchro vus).
+  try {
+    const r = await fetchAllocineViaProxy(query, year);
+    if (r) return r;
+  } catch {
+    /* indisponible */
+  }
+  // 4) Web sans serveur : CORS bloque allocine.fr.
   return null;
+}
+
+/** Notes via le serveur PHP perso (action allocine_ratings). */
+async function fetchAllocineViaProxy(query: string, year?: number | string | null): Promise<AllocineRatings | null> {
+  if (!isServerConfigured()) return null;
+  const data = (await serverApi('allocine_ratings', {
+    query,
+    year: year === undefined || year === null ? '' : String(year),
+  })) as { ratings?: unknown };
+  const r = data?.ratings as Record<string, unknown> | null | undefined;
+  if (!r || typeof r !== 'object') return null;
+  const num = (v: unknown): number | null => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = typeof v === 'number' ? v : parseFloat(String(v).replace(',', '.'));
+    return Number.isFinite(n) && n >= 0 && n <= 5 ? Math.round(n * 10) / 10 : null;
+  };
+  const int = (v: unknown): number | null => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = typeof v === 'number' ? v : parseInt(String(v).replace(/\s/g, ''), 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const str = (v: unknown): string => (typeof v === 'string' ? v : String(v ?? ''));
+  const press = num(r['press']);
+  const spectators = num(r['spectators']);
+  const posterURL = str(r['posterURL']).startsWith('http') ? str(r['posterURL']) : null;
+  const synopsis = str(r['synopsis']).trim() !== '' ? str(r['synopsis']).trim() : null;
+  if (press === null && spectators === null && posterURL === null && synopsis === null) return null;
+  return {
+    title: str(r['title']),
+    year: str(r['year']),
+    url: str(r['url']),
+    press,
+    pressReviews: int(r['pressReviews']),
+    spectators,
+    votes: int(r['votes']),
+    posterURL,
+    synopsis,
+  };
 }
 
 /** 4.2 -> "4,2" (format français Allociné). */

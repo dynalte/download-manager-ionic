@@ -28,6 +28,8 @@ interface Props {
   onSelect: (player: PlexPlayerTarget) => void;
   onRefresh?: () => void;
   refreshing?: boolean;
+  /** Repli Plex Web quand aucun lecteur distant n'est visible. */
+  onPlayInBrowser?: () => void;
   /** Ajout manuel par IP (Fire TV invisible sur plex.tv). */
   onAddManual?: (host: string, port: string) => void;
   onRemoveManual?: (baseURL: string) => void;
@@ -46,7 +48,7 @@ function presenceLabel(p: PlexPlayerTarget): { text: string; color: string } {
   return { text: p.source, color: 'medium' };
 }
 
-const PlayerPicker: React.FC<Props> = ({ isOpen, title, players, debug, diagnostic, onCancel, onSelect, onRefresh, refreshing, onAddManual, onRemoveManual }) => {
+const PlayerPicker: React.FC<Props> = ({ isOpen, title, players, debug, diagnostic, onCancel, onSelect, onRefresh, refreshing, onPlayInBrowser, onAddManual, onRemoveManual }) => {
   const [filter, setFilter] = useState<Filter>('all');
   const [copied, setCopied] = useState(false);
   const [manualHost, setManualHost] = useState('');
@@ -103,10 +105,17 @@ const PlayerPicker: React.FC<Props> = ({ isOpen, title, players, debug, diagnost
           {debug && <p style={{ whiteSpace: 'normal', fontSize: 12, opacity: 0.7 }}>{debug}</p>}
           <p style={{ whiteSpace: 'normal' }}>
             Fire TV absente ? Ouvre l’app Plex sur la TV (même compte, même Wi-Fi), puis Actualiser.
-            Choisis un lecteur « En ligne ».
+            Choisis un lecteur « En ligne » — ou lis directement dans le navigateur.
           </p>
         </IonLabel>
       </IonItem>
+      {onPlayInBrowser && (
+        <div style={{ padding: '0 12px 8px' }}>
+          <IonButton expand="block" fill="outline" onClick={onPlayInBrowser}>
+            Lire ici, dans le navigateur (Plex Web)
+          </IonButton>
+        </div>
+      )}
       <div style={{ padding: '0 12px' }}>
         <IonSegment value={filter} onIonChange={(e) => setFilter(String(e.detail.value) as Filter)}>
           <IonSegmentButton value="all">

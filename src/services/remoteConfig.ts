@@ -28,9 +28,12 @@ export const REMOTE_CONFIG_KEYS: string[] = [
   Keys.tr4kerApiKey,
   // Miroir PHP (CONFIG_KEYS) à mettre à jour côté serveur pour la synchro.
   Keys.c411ApiKey,
+  Keys.v3xApiKey,
   Keys.tr4kerEnabled,
   Keys.c411Enabled,
+  Keys.v3xEnabled,
   Keys.c411ProxyMode,
+  Keys.v3xProxyMode,
   Keys.geminiApiKey,
   Keys.geminiModel,
   Keys.tmdbApiKey,

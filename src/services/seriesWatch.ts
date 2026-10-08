@@ -17,6 +17,8 @@ import { LocalNotifications } from '@capacitor/local-notifications';
 import { settings } from './settings';
 import { transmissionPath } from './settings';
 import { downloadC411Torrent, searchC411, type SourceKeys } from './c411';
+import { titleRelevance } from './tr4kerDiscovery';
+import { downloadV3XTorrent, searchV3X } from './v3x';
 import { uploadTorrentData } from './transmission';
 import { requestAuthorizationIfNeeded } from './completionMonitor';
 
@@ -53,7 +55,7 @@ export interface EpisodeCandidate {
   slug: string;
   /** Label qualité (ex : « 1080p • HEVC • WEB-DL »). */
   quality: string;
-  source: 'tr4ker' | 'c411';
+  source: 'tr4ker' | 'c411' | 'v3x';
   /** URL du .torrent (source C411 : enclosure Torznab). */
   downloadUrl?: string;
 }
@@ -249,7 +251,7 @@ export interface SearchHit {
   slug: string;
   name: string;
   seeders: number;
-  source: 'tr4ker' | 'c411';
+  source: 'tr4ker' | 'c411' | 'v3x';
   /** URL du .torrent (source C411 : enclosure Torznab). */
   downloadUrl?: string;
 }
@@ -396,6 +398,18 @@ async function tr4kerRefined(
   return [];
 }
 
+/** Recherche V3X (JSON, catégorie séries) -> SearchHit. */
+async function v3xWatchSearch(query: string, apiKey: string): Promise<SearchHit[]> {
+  const films = await searchV3X(apiKey, query, { category: 'series', limit: 100 });
+  return films.map((f) => ({
+    slug: f.slug,
+    name: f.name,
+    seeders: f.seeders,
+    source: 'v3x' as const,
+    downloadUrl: f.downloadUrl,
+  }));
+}
+
 /** Recherche C411 (Torznab, catégorie séries) -> SearchHit. */
 async function c411WatchSearch(query: string, apiKey: string): Promise<SearchHit[]> {
   const films = await searchC411(apiKey, query, { category: 'series', limit: 100 });
@@ -430,13 +444,23 @@ async function watchSearch(query: string, keys: SourceKeys, sub?: SeriesSubscrip
       if (!firstErr) firstErr = e;
     }
   }
+  if (keys.v3xApiKey.trim()) {
+    try {
+      lists.push(await v3xWatchSearch(query, keys.v3xApiKey));
+    } catch (e) {
+      if (!firstErr) firstErr = e;
+    }
+  }
   if (lists.length === 0) {
     if (firstErr) throw firstErr;
-    throw new SeriesWatchError('Aucune source active (TR4KER/C411 : clés et interrupteurs, Réglages).');
+    throw new SeriesWatchError('Aucune source active (TR4KER/C411/V3X : clés et interrupteurs, Réglages).');
   }
   const agg = new Map<string, SearchHit>();
   for (const items of lists) for (const it of items) agg.set(it.slug, it);
-  return [...agg.values()];
+  // Comme le Catalogue : pertinence du titre d'abord, seeders en départage.
+  return [...agg.values()].sort(
+    (a, b) => titleRelevance(query, { title: a.name }) - titleRelevance(query, { title: b.name }) || b.seeders - a.seeders,
+  );
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -471,6 +495,7 @@ async function tr4kerDownloadBytes(slug: string, apiKey: string): Promise<Uint8A
 /** Télécharge le .torrent d'un candidat quelle que soit sa source. */
 async function watchDownloadBytes(hit: Pick<SearchHit, 'source' | 'downloadUrl' | 'slug'>, keys: SourceKeys): Promise<Uint8Array> {
   if (hit.source === 'c411') return downloadC411Torrent(hit, keys.c411ApiKey);
+  if (hit.source === 'v3x') return downloadV3XTorrent(hit, keys.v3xApiKey);
   return tr4kerDownloadBytes(hit.slug, keys.tr4kerApiKey);
 }
 
@@ -578,7 +603,7 @@ export async function checkAllSubscriptions(keys: SourceKeys): Promise<CheckResu
 export interface InspectCandidate {
   name: string;
   slug: string;
-  source: 'tr4ker' | 'c411';
+  source: 'tr4ker' | 'c411' | 'v3x';
   /** URL du .torrent (source C411, pour le téléchargement forcé). */
   downloadUrl?: string;
   matchesQuery: boolean;
@@ -661,7 +686,7 @@ export async function inspectSubscription(
  */
 export async function forceDownloadCandidate(
   subId: string,
-  cand: { slug: string; name: string; season: number; episode: number; source?: 'tr4ker' | 'c411'; downloadUrl?: string },
+  cand: { slug: string; name: string; season: number; episode: number; source?: 'tr4ker' | 'c411' | 'v3x'; downloadUrl?: string },
   keys: SourceKeys,
 ): Promise<string> {
   const sub = loadSubscriptions().find((s) => s.id === subId);
@@ -748,14 +773,25 @@ async function searchHitsForTarget(
       }
     }
   }
-  // C411 (Torznab, catégorie séries) : recherche large + ciblée SxxExx ;
+  // C411 (Torznab) / V3X (JSON), catégorie séries : recherche large + ciblée SxxExx ;
   // le filtrage exact (saison/épisode) est fait par pickBest* ci-dessous.
-  if (keys.c411ApiKey.trim()) {
+  if (keys.c411ApiKey.trim() || keys.v3xApiKey.trim()) {
     const queries = episode != null && episode > 0 ? [query, `${query} S${padSE(season)}E${padSE(episode)}`] : [query];
     for (const cq of queries) {
       try {
-        for (const f of await c411WatchSearch(cq, keys.c411ApiKey)) {
-          if (queryMatchesName(query, f.name)) agg.set(f.slug, f);
+        if (keys.c411ApiKey.trim()) {
+          for (const f of await c411WatchSearch(cq, keys.c411ApiKey)) {
+            if (queryMatchesName(query, f.name)) agg.set(f.slug, f);
+          }
+        }
+      } catch {
+        /* source en échec : on garde les autres résultats */
+      }
+      try {
+        if (keys.v3xApiKey.trim()) {
+          for (const f of await v3xWatchSearch(cq, keys.v3xApiKey)) {
+            if (queryMatchesName(query, f.name)) agg.set(f.slug, f);
+          }
         }
       } catch {
         /* source en échec : on garde les autres résultats */

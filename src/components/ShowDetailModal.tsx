@@ -81,7 +81,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
   const [ratings, setRatings] = useState<AllocineRatings | null>(null);
   const [ratingsLoading, setRatingsLoading] = useState(false);
 
-  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '';
+  const hasKey = settings.tr4kerApiKey !== '' || settings.c411ApiKey !== '' || settings.v3xApiKey !== '';
 
   useEffect(() => {
     if (!isOpen || !sub) {
@@ -125,7 +125,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
 
   async function retrieveEpisode(season: number, episode: number) {
     const keys = activeSourceKeys();
-    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !sub || busyKey) return;
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) || !sub || busyKey) return;
     const key = `s${season}e${episode}`;
     setBusyKey(key);
     try {
@@ -141,7 +141,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
 
   async function retrieveSeason(season: ShowDetailSeason) {
     const keys = activeSourceKeys();
-    if ((!keys.tr4kerApiKey && !keys.c411ApiKey) || !sub || busyKey) return;
+    if ((!keys.tr4kerApiKey && !keys.c411ApiKey && !keys.v3xApiKey) || !sub || busyKey) return;
     setBusyKey(`s${season.season}`);
     try {
       const aired = season.episodes.filter((ep) => ep.aired).map((ep) => ep.episode);
@@ -242,7 +242,7 @@ const ShowDetailModal: React.FC<Props> = ({ sub, isOpen, onClose, onToast, onCha
             {!hasKey && (
               <p>
                 <IonText color="warning">
-                  <small>Colle ta clé API TR4KER ou C411 dans Réglages pour récupérer des épisodes.</small>
+                  <small>Colle ta clé API TR4KER, C411 ou V3X dans Réglages pour récupérer des épisodes.</small>
                 </IonText>
               </p>
             )}

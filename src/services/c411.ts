@@ -17,11 +17,13 @@
  * (403 hors navigateur). Modes Réglages : proxy (défaut), direct, auto.
  */
 import { CapacitorHttp } from '@capacitor/core';
+import { Preferences } from '@capacitor/preferences';
 import {
   cleanTitle,
   extractYear,
   searchTorrents as searchTr4ker,
   downloadFilmTorrent,
+  sortFilmsByRelevance,
   type DiscoveryCategoryKey,
   type DiscoveryFilm,
 } from './tr4kerDiscovery';
@@ -218,6 +220,15 @@ function normalizeItem(item: Element): DiscoveryFilm | null {
     const d = new Date(pubDate);
     if (!Number.isNaN(d.getTime())) addedAt = d;
   }
+  // Fiche C411 (<link> = page du torrent : synopsis + specs) + descriptif
+  // brut (<description>, souvent synopsis + MediaInfo côté C411).
+  const detailsUrl = textOf(item, 'link').trim() || textOf(item, 'comments').trim() || undefined;
+  // IDs externes Torznab (C411 les expose : servent au lookup TMDB,
+  // la fiche c411.org exigeant une session web inaccessible au proxy).
+  const imdbRaw = (values['imdbid'] ?? '').trim();
+  const tmdbRaw = parseInt(String(values['tmdbid'] ?? ''), 10);
+  const rawDesc = textOf(item, 'description').trim();
+  const description = rawDesc ? rawDesc.replace(/\s+/g, ' ').trim().slice(0, 4000) || undefined : undefined;
   const slug = infohash
     ? `c411:${infohash}`
     : `c411:noid:${sizeEl || sizeAttr}:${name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)}`;
@@ -235,6 +246,10 @@ function normalizeItem(item: Element): DiscoveryFilm | null {
     isFreeleech: false,
     source: 'c411',
     downloadUrl,
+    ...(Number.isFinite(tmdbRaw) && tmdbRaw > 0 ? { tmdbId: tmdbRaw } : {}),
+    ...(imdbRaw ? { imdbId: imdbRaw } : {}),
+    ...(detailsUrl ? { detailsUrl } : {}),
+    ...(description ? { description } : {}),
   };
 }
 
@@ -460,21 +475,281 @@ export async function downloadC411Torrent(film: Pick<DiscoveryFilm, 'downloadUrl
   return bytes;
 }
 
-// ---------- Recherche fusionnée TR4KER + C411 ----------
+// ---------- Détails fiche C411 (synopsis + technique) ----------
+
+export interface C411Detail {
+  synopsis: string | null;
+  /** Bloc technique brut (MediaInfo / NFO / specs, texte nettoyé). */
+  techDetails: string | null;
+  /** Étiquettes extraites du nom du torrent (1080p, x265, WEB-DL…). */
+  techTags: string[];
+  pageUrl: string | null;
+}
+
+/** Étiquettes techniques lues dans le nom du torrent (toujours dispo, sans réseau). */
+export function parseTechTags(name: string): string[] {
+  const upper = ` ${name.replace(/[._-]+/g, ' ').toUpperCase()} `;
+  const tags: string[] = [];
+  const push = (v: string | null) => {
+    if (v && !tags.includes(v)) tags.push(v);
+  };
+  const pick = (re: RegExp): string | null => {
+    const m = re.exec(upper);
+    return m ? m[1].replace(/\s+/g, '-').replace(/^-+|-+$/g, '') : null;
+  };
+  push(pick(/\s(2160P|1080P|1080I|720P|576P|480P|4K|UHD)\s/));
+  push(pick(/\s(WEB-DL|WEBRIP|WEBRIP|BDRIP|BLU-RAY|BLURAY|REMUX|HDTV|DVDSCREENER|DVDSCR|DVDRIP|HDCAM|CAM|TS|TELESYNC)\s/));
+  push(pick(/\s(X264|H264|X265|H265|HEVC|AV1|XVID|DIVX)\s/));
+  push(pick(/\s(DTS-HD-MA|DTS-HD|DTS|TRUEHD|ATMOS|DOLBY-ATMOS|AC3|EAC3|AAC|OPUS|FLAC|MP3)\s/));
+  // Langues : libellés FR usuels des trackers (MULTi en tête = le plus courant).
+  push(pick(/\s(MULTI|TRUEFRENCH|VFI|VFQ|FRENCH|VFF|VF|VOSTFR|SUBFRENCH|VOST|FASTSUB)\s/));
+  // HDR / 10 bits quand mentionnés.
+  push(pick(/\s(HDR10PLUS|HDR10|DOLBY-VISION|DV-HDR|HDR|10BITS|10BIT)\s/));
+  return tags;
+}
+
+const C411_DETAIL_TTL = 30 * 24 * 3600 * 1000;
+
+export interface TechRow {
+  label: string;
+  value: string;
+}
+
+/** Lignes « Source / Résolution / Codec / Audio / Langues » lues dans le nom
+ * du torrent (même source que les badges, présentées comme la fiche C411).
+ */
+export function techRowsFor(name: string): TechRow[] {
+  const upper = ` ${name.replace(/[._-]+/g, ' ').toUpperCase()} `;
+  const pick = (re: RegExp): string | null => {
+    const m = re.exec(upper);
+    return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+  };
+  const rows: TechRow[] = [];
+  const source = pick(/\s(WEB-DL|WEBRIP|BLU-RAY|BLURAY|REMUX|HDTV|DVDSCREENER|DVDSCR|DVDRIP|HDCAM|CAM|TS|TELESYNC)\s/);
+  if (source) rows.push({ label: 'Source', value: source.replace(/BLURAY/, 'BluRay') });
+  const res = pick(/\s(2160P|1080P|1080I|720P|576P|480P|4K|UHD)\s/);
+  if (res) rows.push({ label: 'Résolution', value: res });
+  const codec = pick(/\s(X264|H264|X265|H265|HEVC|AV1|XVID|DIVX)\s/);
+  if (codec) rows.push({ label: 'Codec vidéo', value: codec });
+  const audio = pick(/\s(DTS-HD-MA|DTS-HD|DTS|TRUEHD|ATMOS|DOLBY-ATMOS|AC3|EAC3|AAC|OPUS|FLAC|MP3)\s/);
+  if (audio) rows.push({ label: 'Audio', value: audio });
+  const lang = pick(/\s(MULTI|TRUEFRENCH|VFI|VFQ|FRENCH|VFF|VF|VOSTFR|SUBFRENCH|VOST|FASTSUB)\s/);
+  if (lang) rows.push({ label: 'Langues', value: lang });
+  const hdr = pick(/\s(HDR10PLUS|HDR10|DOLBY-VISION|DV-HDR|HDR)\s/);
+  if (hdr) rows.push({ label: 'HDR', value: hdr });
+  return rows;
+}
+const C411_DETAIL_CACHE_KEY = 'c411-detail-cache-v1';
+const C411_DETAIL_MAX = 300;
+const c411DetailCache = new Map<string, { at: number; data: C411Detail }>();
+let c411DetailCacheLoaded = false;
+
+async function loadC411DetailCache(): Promise<void> {
+  if (c411DetailCacheLoaded) return;
+  c411DetailCacheLoaded = true;
+  try {
+    const { value } = await Preferences.get({ key: C411_DETAIL_CACHE_KEY });
+    if (!value) return;
+    const obj = JSON.parse(value) as Record<string, { at: number; data: C411Detail }>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === 'object' && v.data) c411DetailCache.set(k, v);
+    }
+  } catch {
+    /* premier lancement */
+  }
+}
+
+function saveC411DetailCache(): void {
+  try {
+    const obj: Record<string, { at: number; data: C411Detail }> = {};
+    for (const [k, v] of c411DetailCache) obj[k] = v;
+    void Preferences.set({ key: C411_DETAIL_CACHE_KEY, value: JSON.stringify(obj) }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+function decodeC411Entities(s: string): string {
+  return String(s ?? '')
+    .replace(/&#(\d+);/g, (_, n: string) => {
+      const c = parseInt(n, 10);
+      return Number.isFinite(c) ? String.fromCharCode(c) : _;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n: string) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&hellip;/g, '…');
+}
+
+function c411Meta(html: string, name: string): string | null {
+  const re1 = new RegExp(`<meta[^>]+(?:property|name)=["']${name}["'][^>]+content=["']([^"']+)["']`, 'i');
+  const re2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${name}["']`, 'i');
+  const m = re1.exec(html) || re2.exec(html);
+  return m ? decodeC411Entities(m[1]).trim() : null;
+}
+
+function stripC411Html(fragment: string): string {
+  return decodeC411Entities(
+    fragment
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|tr|h\d)>/gi, '\n')
+      .replace(/<[^>]+>/g, ' '),
+  )
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n')
+    .trim();
+}
+
+/** Premier long paragraphe narratif (synopsis probable), hors menus/specs. */
+export function extractTrackerPageSynopsis(html: string): string | null {
+  const meta = c411Meta(html, 'og:description') || c411Meta(html, 'description');
+  if (meta) {
+    const txt = meta.replace(/\s+/g, ' ').trim();
+    if (txt.length >= 80 && !/c411|torrent|tracker|connexion|inscription/i.test(txt.slice(0, 120))) return txt.slice(0, 2000);
+  }
+  // Blocs dédiés d'abord (thèmes C411 / Gazelle-like : synopsis, description).
+  const blockRe =
+    /<(div|section|p)[^>]+class=["'][^"']*(synopsis|description|resume|presentation)[^"']*["'][^>]*>([\s\S]{40,4000}?)<\/\1>/i;
+  const block = blockRe.exec(html);
+  if (block) {
+    const txt = stripC411Html(block[3]).replace(/\s+/g, ' ').trim();
+    if (txt.length >= 80) return txt.slice(0, 2000);
+  }
+  // Repli : plus long paragraphe narratif de la page.
+  const paras = [...html.matchAll(/<p[^>]*>([\s\S]{80,3000}?)<\/p>/gi)]
+    .map((m) => stripC411Html(m[1]).replace(/\s+/g, ' ').trim())
+    .filter((t) => t.length >= 100 && !/torrent|seeders|leechers|connectez|inscrivez|ratio|upload/i.test(t.slice(0, 200)));
+  if (paras.length > 0) {
+    paras.sort((a, b) => b.length - a.length);
+    return paras[0].slice(0, 2000);
+  }
+  return null;
+}
+
+/** Bloc MediaInfo / NFO / specs (pre, code, table) nettoyé. */
+export function extractTrackerPageTech(html: string, fallbackDesc?: string): string | null {
+  const pre = /<(pre|code)[^>]*>([\s\S]{20,6000}?)<\/\1>/i.exec(html);
+  if (pre) {
+    const txt = stripC411Html(pre[2]).trim();
+    if (txt.length >= 20) return txt.slice(0, 3000);
+  }
+  const nfo = /<(div|section|table)[^>]+class=["'][^"']*(nfo|mediainfo|tech|specs?|details?)[^"']*["'][^>]*>([\s\S]{20,6000}?)<\/\1>/i.exec(html);
+  if (nfo) {
+    const txt = stripC411Html(nfo[3]).trim();
+    if (txt.length >= 20) return txt.slice(0, 3000);
+  }
+  if (fallbackDesc) {
+    const txt = stripC411Html(fallbackDesc).replace(/\s+/g, ' ').trim();
+    if (txt.length >= 20) return txt.slice(0, 2000);
+  }
+  return null;
+}
+
+async function fetchC411PageHtml(url: string, apiKey: string): Promise<string> {
+  const mode = settings.c411ProxyMode;
+  if (mode === 'proxy') {
+    if (!isServerConfigured()) throw new C411Error('Serveur perso non configuré : proxy C411 impossible.');
+    const data = (await serverApi('c411_detail', { url, apikey: apiKey })) as { status?: unknown; html?: unknown };
+    const status = typeof data.status === 'number' ? data.status : 0;
+    const html = typeof data.html === 'string' ? data.html : '';
+    if (status < 200 || status >= 300 || !html) throw new C411Error(`Fiche C411 : HTTP ${status || 'inconnu'}.`);
+    return html;
+  }
+  try {
+    const res = await CapacitorHttp.get({
+      url,
+      headers: { Accept: 'text/html,*/*' },
+      responseType: 'text',
+      connectTimeout: 15000,
+      readTimeout: 25000,
+    });
+    if (res.status < 200 || res.status >= 300) throw new C411Error(`Fiche C411 : HTTP ${res.status}.`);
+    const html = typeof res.data === 'string' ? res.data : '';
+    if (!html) throw new C411Error('Fiche C411 vide.');
+    return html;
+  } catch (e) {
+    if (mode === 'auto' && e instanceof C411Error && e.isNetworkFailure && isServerConfigured()) {
+      const data = (await serverApi('c411_detail', { url, apikey: apiKey })) as { status?: unknown; html?: unknown };
+      const status = typeof data.status === 'number' ? data.status : 0;
+      const html = typeof data.html === 'string' ? data.html : '';
+      if (status < 200 || status >= 300 || !html) throw new C411Error(`Fiche C411 : HTTP ${status || 'inconnu'}.`);
+      return html;
+    }
+    throw e;
+  }
+}
+
+/**
+ * Synopsis + détails techniques d'un résultat C411.
+ * - techTags : toujours (lus dans le nom, sans réseau).
+ * - synopsis/techDetails : fiche c411.org via proxy (défaut) ou direct ;
+ *   repli sur le <description> Torznab si la fiche est injoignable.
+ * Cache 30 jours (mémoire + Preferences).
+ */
+export async function fetchC411Detail(
+  film: Pick<DiscoveryFilm, 'slug' | 'name' | 'detailsUrl' | 'description'>,
+  apiKey = '',
+): Promise<C411Detail> {
+  const techTags = parseTechTags(film.name);
+  const pageUrl = (film.detailsUrl ?? '').trim() || null;
+  const cacheKey = pageUrl || `slug:${film.slug}`;
+  const now = Date.now();
+  await loadC411DetailCache();
+  const hit = c411DetailCache.get(cacheKey);
+  if (hit && now - hit.at < C411_DETAIL_TTL) return hit.data;
+  let synopsis: string | null = null;
+  let techDetails: string | null = null;
+  if (pageUrl && /^https?:\/\/c411\.org\//i.test(pageUrl)) {
+    try {
+      const html = await fetchC411PageHtml(pageUrl, apiKey.trim());
+      synopsis = extractTrackerPageSynopsis(html);
+      techDetails = extractTrackerPageTech(html, film.description);
+    } catch {
+      /* repli description Torznab ci-dessous */
+    }
+  }
+  if (!techDetails && film.description) {
+    techDetails = stripC411Html(film.description).replace(/\s+/g, ' ').trim().slice(0, 2000) || null;
+  }
+  // La description Torznab commence souvent par le synopsis : si la fiche
+  // n'a rien livré, en extraire la partie narrative (>= 80 car.).
+  if (!synopsis && film.description) {
+    const txt = stripC411Html(film.description).replace(/\s+/g, ' ').trim();
+    if (txt.length >= 80) synopsis = txt.slice(0, 2000);
+  }
+  const data: C411Detail = { synopsis, techDetails, techTags, pageUrl };
+  c411DetailCache.set(cacheKey, { at: now, data });
+  if (c411DetailCache.size > C411_DETAIL_MAX) {
+    const first = c411DetailCache.keys().next();
+    if (!first.done) c411DetailCache.delete(first.value);
+  }
+  saveC411DetailCache();
+  return data;
+}
+
+// ---------- Recherche fusionnée TR4KER + C411 + V3X ----------
 
 export interface SourceKeys {
   tr4kerApiKey: string;
   c411ApiKey: string;
+  v3xApiKey: string;
 }
 
 /**
- * Clés des sources activées dans Réglages (interrupteurs TR4KER/C411).
+ * Clés des sources activées dans Réglages (interrupteurs TR4KER/C411/V3X).
  * Une source désactivée ou sans clé vaut '' et est ignorée des recherches.
  */
 export function activeSourceKeys(): SourceKeys {
   return {
     tr4kerApiKey: settings.tr4kerEnabled ? settings.tr4kerApiKey : '',
     c411ApiKey: settings.c411Enabled ? settings.c411ApiKey : '',
+    v3xApiKey: settings.v3xEnabled ? settings.v3xApiKey : '',
   };
 }
 
@@ -488,22 +763,22 @@ export interface SearchAllOptions {
 export interface SearchAllResult {
   films: DiscoveryFilm[];
   /** Sources effectivement interrogées. */
-  sources: Array<'tr4ker' | 'c411'>;
-  /** Erreurs des sources en échec (résultats partiels quand l'autre a répondu). */
+  sources: Array<'tr4ker' | 'c411' | 'v3x'>;
+  /** Erreurs des sources en échec (résultats partiels quand une autre a répondu). */
   partialErrors: string[];
 }
 
 /**
- * Recherche un titre sur TR4KER et/ou C411 (selon les clés renseignées),
+ * Recherche un titre sur TR4KER, C411 et/ou V3X (selon les clés renseignées),
  * fusionnée et triée par seeders. Au moins une source doit répondre ;
- * l'échec d'une source n'annule pas les résultats de l'autre.
+ * l'échec d'une source n'annule pas les résultats des autres.
  */
 export async function searchAllSources(query: string, keys: SourceKeys, opts: SearchAllOptions = {}): Promise<SearchAllResult> {
   const q = query.trim();
   if (!q) throw new C411Error('Recherche vide.');
   const { category = null, limit = 25 } = opts;
   const jobs: Array<Promise<DiscoveryFilm[]>> = [];
-  const sources: Array<'tr4ker' | 'c411'> = [];
+  const sources: Array<'tr4ker' | 'c411' | 'v3x'> = [];
   if (keys.tr4kerApiKey.trim()) {
     sources.push('tr4ker');
     jobs.push(searchTr4ker(keys.tr4kerApiKey, q, limit));
@@ -512,7 +787,12 @@ export async function searchAllSources(query: string, keys: SourceKeys, opts: Se
     sources.push('c411');
     jobs.push(searchC411(keys.c411ApiKey, q, { category, limit }));
   }
-  if (jobs.length === 0) throw new C411Error('Clé API TR4KER ou C411 manquante (Réglages).');
+  if (keys.v3xApiKey.trim()) {
+    const { searchV3X } = await import('./v3x');
+    sources.push('v3x');
+    jobs.push(searchV3X(keys.v3xApiKey, q, { category, limit }));
+  }
+  if (jobs.length === 0) throw new C411Error('Clé API TR4KER, C411 ou V3X manquante (Réglages).');
   const settled = await Promise.allSettled(jobs);
   const films: DiscoveryFilm[] = [];
   const partialErrors: string[] = [];
@@ -525,19 +805,23 @@ export async function searchAllSources(query: string, keys: SourceKeys, opts: Se
         films.push(f);
       }
     } else {
-      const label = sources[i] === 'c411' ? 'C411' : 'TR4KER';
+      const label = sources[i] === 'c411' ? 'C411' : sources[i] === 'v3x' ? 'V3X' : 'TR4KER';
       partialErrors.push(`${label} : ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
     }
   });
   if (films.length === 0 && partialErrors.length > 0) {
     throw new Error(partialErrors.join(' / '));
   }
-  films.sort((a, b) => b.seeders - a.seeders);
-  return { films, sources, partialErrors };
+  const ranked = sortFilmsByRelevance(films, q);
+  return { films: ranked, sources, partialErrors };
 }
 
 /** Télécharge le .torrent d'un résultat quelle que soit sa source. */
 export async function downloadFromSource(film: DiscoveryFilm, keys: SourceKeys): Promise<Uint8Array> {
   if (film.source === 'c411') return downloadC411Torrent(film, keys.c411ApiKey);
+  if (film.source === 'v3x') {
+    const { downloadV3XTorrent } = await import('./v3x');
+    return downloadV3XTorrent(film, keys.v3xApiKey);
+  }
   return downloadFilmTorrent(film.slug, keys.tr4kerApiKey);
 }

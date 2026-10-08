@@ -13,6 +13,7 @@ export const AppConfig = {
   fileServerPassword: 'lavrcestbien',
   tr4kerApiKey: '',
   c411ApiKey: '',
+  v3xApiKey: '',
 } as const;
 
 export const TR4KER_URL = 'https://tr4ker.net/';

@@ -166,3 +166,181 @@ export async function testTmdbConnection(apiKey: string): Promise<string> {
   if (!found?.posterURL) throw new TmdbError('TMDB ne renvoie aucune affiche (clé invalide ?).');
   return `TMDB OK : affiche trouvée (« ${found.title} »).`;
 }
+
+// ---------- Fiche détaillée (repli quand la fiche C411 exige un login) ----------
+
+export interface TmdbDetails {
+  title: string;
+  year: string;
+  overview: string | null;
+  /** Durée en minutes (film) ou par épisode (série). */
+  runtimeMin: number | null;
+  genres: string[];
+  countries: string[];
+  director: string | null;
+  cast: string[];
+  /** Note TMDB /10 (vote_average). */
+  rating: number | null;
+  votes: number | null;
+  posterURL: string | null;
+}
+
+const DETAIL_TTL = 30 * 24 * 3600 * 1000;
+const DETAIL_CACHE_KEY = 'tmdb-detail-cache-v1';
+const DETAIL_CACHE_MAX = 300;
+
+const detailCache = new Map<string, { at: number; data: TmdbDetails | null }>();
+let detailCacheLoaded = false;
+
+async function loadDetailCache(): Promise<void> {
+  if (detailCacheLoaded) return;
+  detailCacheLoaded = true;
+  try {
+    const { value } = await Preferences.get({ key: DETAIL_CACHE_KEY });
+    if (!value) return;
+    const obj = JSON.parse(value) as Record<string, { at: number; data: TmdbDetails | null }>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === 'object') detailCache.set(k, v);
+    }
+  } catch {
+    /* premier lancement */
+  }
+}
+
+function saveDetailCache(): void {
+  try {
+    const obj: Record<string, { at: number; data: TmdbDetails | null }> = {};
+    for (const [k, v] of detailCache) obj[k] = v;
+    void Preferences.set({ key: DETAIL_CACHE_KEY, value: JSON.stringify(obj) }).catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+async function tmdbGet(apiKey: string, path: string, params: Record<string, string>): Promise<unknown> {
+  let res;
+  try {
+    res = await CapacitorHttp.get({
+      url: `https://api.themoviedb.org/3${path}`,
+      params: { api_key: apiKey, language: 'fr-FR', ...params },
+      headers: { Accept: 'application/json' },
+      responseType: 'text',
+      connectTimeout: 12000,
+      readTimeout: 20000,
+    });
+  } catch (e) {
+    throw new TmdbError(`TMDB injoignable (${e instanceof Error ? e.message : String(e)}).`);
+  }
+  if (res.status === 401 || res.status === 403) throw new TmdbError('Clé TMDB refusée (vérifie-la dans Réglages).');
+  if (res.status === 404) throw new TmdbError('Fiche TMDB introuvable.');
+  if (res.status < 200 || res.status >= 300) throw new TmdbError(`TMDB : HTTP ${res.status}.`);
+  const raw = typeof res.data === 'string' ? res.data : JSON.stringify(res.data ?? {});
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new TmdbError('Réponse TMDB illisible.');
+  }
+}
+
+/**
+ * Fiche TMDB complète par ID TMDB (ou IMDb via /find).
+ * `kind` = 'movie' ou 'tv' (déduit de la catégorie Catalogue côté appelant).
+ */
+export async function fetchTmdbDetails(
+  apiKey: string,
+  opts: { tmdbId?: number; imdbId?: string; kind?: 'movie' | 'tv' },
+): Promise<TmdbDetails | null> {
+  const key = apiKey.trim();
+  if (!key) return null;
+  const cacheKey = `id:${opts.tmdbId ?? ''}|imdb:${opts.imdbId ?? ''}|${opts.kind ?? 'movie'}`;
+  const now = Date.now();
+  await loadDetailCache();
+  const hit = detailCache.get(cacheKey);
+  if (hit && now - hit.at < DETAIL_TTL) return hit.data;
+  let data: TmdbDetails | null = null;
+  try {
+    let tmdbId = typeof opts.tmdbId === 'number' && opts.tmdbId > 0 ? opts.tmdbId : 0;
+    let kind: 'movie' | 'tv' = opts.kind ?? 'movie';
+    const imdb = (opts.imdbId ?? '').trim();
+    if (!tmdbId && imdb) {
+      const found = (await tmdbGet(key, `/find/${encodeURIComponent(imdb)}`, { external_source: 'imdb_id' })) as {
+        movie_results?: Array<{ id?: number }>;
+        tv_results?: Array<{ id?: number }>;
+      };
+      const movieHit = Array.isArray(found.movie_results) ? found.movie_results[0]?.id : undefined;
+      const tvHit = Array.isArray(found.tv_results) ? found.tv_results[0]?.id : undefined;
+      if (kind === 'tv' && tvHit) tmdbId = tvHit;
+      else if (movieHit) {
+        tmdbId = movieHit;
+        kind = 'movie';
+      } else if (tvHit) {
+        tmdbId = tvHit;
+        kind = 'tv';
+      }
+    }
+    if (!tmdbId) throw new TmdbError('Sans ID.');
+    const d = (await tmdbGet(key, `/${kind}/${tmdbId}`, { append_to_response: 'credits' })) as {
+      title?: unknown;
+      name?: unknown;
+      overview?: unknown;
+      runtime?: unknown;
+      episode_run_time?: unknown;
+      release_date?: unknown;
+      first_air_date?: unknown;
+      genres?: Array<{ name?: unknown }>;
+      production_countries?: Array<{ name?: unknown }>;
+      vote_average?: unknown;
+      vote_count?: unknown;
+      poster_path?: unknown;
+      credits?: { cast?: Array<{ name?: unknown }>; crew?: Array<{ name?: unknown; job?: unknown }> };
+    };
+    const runtimeRaw =
+      typeof d.runtime === 'number' && d.runtime > 0
+        ? d.runtime
+        : Array.isArray(d.episode_run_time) && typeof d.episode_run_time[0] === 'number' && d.episode_run_time[0] > 0
+          ? d.episode_run_time[0]
+          : null;
+    const ratingRaw = typeof d.vote_average === 'number' ? d.vote_average : parseFloat(String(d.vote_average ?? ''));
+    const votesRaw = typeof d.vote_count === 'number' ? d.vote_count : parseInt(String(d.vote_count ?? ''), 10);
+    const cast = (Array.isArray(d.credits?.cast) ? d.credits!.cast! : [])
+      .map((c) => String(c.name ?? '').trim())
+      .filter(Boolean)
+      .slice(0, 5);
+    const director =
+      (Array.isArray(d.credits?.crew) ? d.credits!.crew! : [])
+        .map((c) => ({ name: String(c.name ?? '').trim(), job: String(c.job ?? '') }))
+        .find((c) => c.name && /^(director|réalisateur)$/i.test(c.job))?.name ?? null;
+    const overview = String(d.overview ?? '').trim();
+    data = {
+      title: String(d.title ?? d.name ?? ''),
+      year: String(d.release_date ?? d.first_air_date ?? '').slice(0, 4),
+      overview: overview !== '' ? overview : null,
+      runtimeMin: runtimeRaw,
+      genres: (Array.isArray(d.genres) ? d.genres : []).map((g) => String(g.name ?? '').trim()).filter(Boolean),
+      countries: (Array.isArray(d.production_countries) ? d.production_countries : [])
+        .map((c) => String(c.name ?? '').trim())
+        .filter(Boolean),
+      director,
+      cast,
+      rating: Number.isFinite(ratingRaw) && ratingRaw >= 0 && ratingRaw <= 10 ? Math.round(ratingRaw * 10) / 10 : null,
+      votes: Number.isFinite(votesRaw) && votesRaw >= 0 ? votesRaw : null,
+      posterURL: typeof d.poster_path === 'string' && d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : null,
+    };
+  } catch {
+    data = null;
+  }
+  detailCache.set(cacheKey, { at: now, data });
+  if (detailCache.size > DETAIL_CACHE_MAX) {
+    const first = detailCache.keys().next();
+    if (!first.done) detailCache.delete(first.value);
+  }
+  saveDetailCache();
+  return data;
+}
+
+/** 149 min -> "2h29" (présentation façon fiche C411). */
+export function formatRuntime(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}` : `${m}min`;
+}

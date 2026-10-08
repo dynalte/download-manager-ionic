@@ -94,10 +94,16 @@ export interface DiscoveryFilm {
   catSlug?: string;
   isFreeleech: boolean;
   tmdbId?: number;
-  /** Tracker d'origine (C411 : voir c411.ts, recherche fusionnée). */
-  source: 'tr4ker' | 'c411';
+  /** ID IMDb (tt...) — exposé par le Torznab C411, repli lookup TMDB. */
+  imdbId?: string;
+  /** Tracker d'origine (C411 : voir c411.ts, V3X : voir v3x.ts). */
+  source: 'tr4ker' | 'c411' | 'v3x';
   /** URL du .torrent (source C411 : enclosure Torznab, clé incluse). */
   downloadUrl?: string;
+  /** URL de la fiche C411 (champ <link> Torznab : synopsis + specs). */
+  detailsUrl?: string;
+  /** Descriptif brut embarqué dans le flux Torznab (<description>). */
+  description?: string;
 }
 
 export class DiscoveryError extends Error {}
@@ -334,6 +340,58 @@ function normTokens(s: string): string[] {
     .replace(/[^a-z0-9]+/g, ' ')
     .split(' ')
     .filter((t) => t.length > 2 && !/^(19|20)\d{2}$/.test(t));
+}
+
+function normText(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * Pertinence d'un titre face à la requête (tri des recherches Catalogue).
+ * Ordre : titre exact > commence par la requête > contient la requête >
+ * tous les mots dans l'ordre > mots épars (couverture). Les seeders ne
+ * servent qu'à départager (triés après, voir sortFilmsByRelevance) : un
+ * match exact peu seedé passe devant un titre approché très seedé.
+ */
+export function titleRelevance(query: string, film: Pick<DiscoveryFilm, 'title'>): number {
+  const q = normText(query);
+  const t = normText(film.title);
+  if (!q || !t) return 0;
+  if (t === q) return 1_000_000;
+  if (t.startsWith(q)) return 500_000;
+  if (t.includes(q)) return 200_000;
+  const qw = q.split(' ').filter((w) => w.length > 1);
+  if (qw.length === 0) return 0;
+  const tw = t.split(' ').filter(Boolean);
+  const tset = new Set(tw);
+  let hits = 0;
+  for (const w of qw) if (tset.has(w)) hits++;
+  if (hits === 0) return 0;
+  // Tous les mots présents dans l'ordre (ex : « fifi et sa bande… ») : fort bonus.
+  let ordered = true;
+  let pos = -1;
+  for (const w of qw) {
+    const next = tw.indexOf(w, pos + 1);
+    if (next < 0) {
+      ordered = false;
+      break;
+    }
+    pos = next;
+  }
+  const coverage = hits / qw.length;
+  return (ordered ? 50_000 : 0) + Math.round(coverage * 10_000) + hits;
+}
+
+/** Tri d'une recherche : pertinence du titre d'abord, seeders en départage. */
+export function sortFilmsByRelevance(films: DiscoveryFilm[], query: string): DiscoveryFilm[] {
+  const scored = films.map((f) => ({ f, r: titleRelevance(query, f) }));
+  scored.sort((a, b) => b.r - a.r || b.f.seeders - a.f.seeders);
+  return scored.map((s) => s.f);
 }
 
 /** Le nom candidat désigne-t-il le même film (titre + millésime) ? */

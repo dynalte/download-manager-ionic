@@ -161,7 +161,12 @@ export const settings = {
   /** Serveur HTTP des fichiers téléchargés (envoi e-books). */
   get fileServerBaseURL(): string {
     const stored = getString(Keys.fileServerBaseURL, '').trim().replace(/\/+$/, '');
-    return stored === '' ? AppConfig.fileServerBaseURL : stored;
+    // Migration : l'ancien défaut http://...:8080 est bloqué en mixed-content
+    // depuis la page https (mêmes fichiers servis en https même origine).
+    if (stored === '' || stored === 'http://photos2.dynaspirit.com:8080') {
+      return AppConfig.fileServerBaseURL;
+    }
+    return stored;
   },
   get fileServerUsername(): string {
     const stored = getString(Keys.fileServerUsername, '').trim();

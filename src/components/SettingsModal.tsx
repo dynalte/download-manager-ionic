@@ -330,7 +330,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             </IonLabel>
           </IonItem>
           <IonItem>
-            <IonInput label="URL de base" labelPlacement="stacked" value={fileServerURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setFileServerURL(String(e.detail.value ?? ''))} placeholder="http://serveur:8080" />
+            <IonInput label="URL de base" labelPlacement="stacked" value={fileServerURL} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setFileServerURL(String(e.detail.value ?? ''))} placeholder="https://photos2.dynaspirit.com" />
           </IonItem>
           <IonItem>
             <IonInput label="Nom d'utilisateur" labelPlacement="stacked" value={fileServerUser} autocapitalize="off" autocorrect="off" spellcheck={false} onIonInput={(e) => setFileServerUser(String(e.detail.value ?? ''))} />

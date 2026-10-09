@@ -8,7 +8,9 @@ export const AppConfig = {
   plexBaseURL: 'http://photos2.dynaspirit.com:32400',
   plexToken: '',
   plexUseCloudDefault: false,
-  fileServerBaseURL: 'http://photos2.dynaspirit.com:8080',
+  // Même origine https que la PWA (même conteneur Apache que le :8080) :
+  // évite mixed-content + CORS sur le fetch des e-books.
+  fileServerBaseURL: 'https://photos2.dynaspirit.com',
   fileServerUsername: 'vr',
   fileServerPassword: 'lavrcestbien',
   tr4kerApiKey: '',

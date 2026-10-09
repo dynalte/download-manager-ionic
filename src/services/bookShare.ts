@@ -2,10 +2,12 @@
  * Envoi d'e-books (dossier "livres") par e-mail : liseuses Kindle de
  * Stéphanie / Anaïs / Timéa + adresse de test de Nicolas.
  *
- * Chaîne : fichier rapatrié depuis le serveur HTTP (port 8080, Basic Auth)
- * -> écrit dans le cache -> composeur Mail natif (cordova-plugin-email,
- * destinataire + pièce jointe) avec repli feuille de partage iOS.
- * Hors natif : téléchargement navigateur + mailto pré-rempli (sans PJ).
+ * Chaîne : fichier rapatrié depuis le serveur https même origine (Basic Auth,
+ * pas de mixed-content ni CORS) -> écrit dans le cache -> composeur Mail
+ * natif (cordova-plugin-email, destinataire + pièce jointe) avec repli
+ * feuille de partage iOS.
+ * Hors natif (PWA/web) : Web Share API avec fichier (vrai PJ vers Mail/Gmail)
+ * quand dispo, sinon téléchargement navigateur + mailto pré-rempli (sans PJ).
  *
  * Multi-fichiers : si le torrent est un dossier, le fichier interne est
  * choisi via fetchTorrentFiles (transmission.ts) puis téléchargé sous
@@ -19,6 +21,7 @@ import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import { folderForDownloadDir, settings } from './settings';
+import { isServerConfigured, serverApi } from './serverApi';
 
 export interface BookRecipient {
   id: string;
@@ -283,6 +286,49 @@ export function toEmailAttachmentPath(uri: string): string {
   }
 }
 
+/** Type MIME pour la pièce jointe partagée (défaut générique). */
+function guessBookMimeType(filename: string, contentType: string): string {
+  const ct = contentType.split(';')[0].trim().toLowerCase();
+  if (ct && ct !== 'application/octet-stream') return ct;
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.epub')) return 'application/epub+zip';
+  if (lower.endsWith('.pdf')) return 'application/pdf';
+  if (lower.endsWith('.mobi') || lower.endsWith('.azw') || lower.endsWith('.azw3') || lower.endsWith('.kfx')) {
+    return 'application/x-mobipocket-ebook';
+  }
+  if (lower.endsWith('.txt')) return 'text/plain';
+  return 'application/octet-stream';
+}
+
+/**
+ * Partage web avec fichier (PWA/mobile) : null si indisponible (repli
+ * download + mailto par l'appelant), 'cancelled' si l'utilisateur annule.
+ * Un refus du navigateur (ex: geste utilisateur expiré) vaut aussi null.
+ */
+async function shareBookFileWeb(
+  bytes: Uint8Array,
+  contentType: string,
+  filename: string,
+  displayName: string,
+  recipient: BookRecipient,
+): Promise<BookSendResult | null> {
+  try {
+    if (typeof navigator.canShare !== 'function' || typeof navigator.share !== 'function') return null;
+    const file = new File([bytes.buffer as ArrayBuffer], filename, { type: guessBookMimeType(filename, contentType) });
+    if (!navigator.canShare({ files: [file] })) return null;
+    await navigator.share({
+      title: `[Livre] ${displayName}`,
+      text: `Pour ${recipient.name} (${recipient.email}) : ${displayName}`,
+      files: [file],
+    });
+    return 'shared';
+  } catch (e) {
+    // Annulation utilisateur -> on ne bascule pas sur le repli download.
+    if (e instanceof Error && (e.name === 'AbortError' || /abort|cancel/i.test(e.message))) return 'cancelled';
+    return null;
+  }
+}
+
 /**
  * Envoie le fichier d'un téléchargement terminé par e-mail au destinataire.
  * Natif : composeur Mail (PJ) ou feuille de partage en repli.
@@ -305,20 +351,41 @@ export async function sendBookByEmail(
     );
   }
   const targetLabel = inner !== '' ? inner : item.name;
+  // Envoi côté serveur en priorité (synchro configurée) : le PHP joint le
+  // fichier et l'envoie en SMTP (indispensable sur PWA où mailto: ne peut
+  // pas joindre de PJ). Repli local si le PHP est trop vieux pour book_send.
+  if (isServerConfigured()) {
+    try {
+      await serverApi('book_send', {
+        downloadDir: item.downloadDir,
+        name: item.name,
+        innerFile: inner !== '' ? inner : undefined,
+        to: recipient.email,
+      });
+      return 'sent';
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/action inconnue/i.test(msg)) throw new BookShareError(`Envoi serveur : ${msg}`);
+    }
+  }
   const url = inner !== ''
     ? buildFileServerURLForRelativePath(item.downloadDir, inner, item.name)
     : buildFileServerURL(item.downloadDir, item.name);
   if (!url) {
     throw new BookShareError('Dossier hors de l’arborescence du serveur de fichiers (/downloads).');
   }
-  const { bytes } = await downloadBookBytes(url, targetLabel);
+  const { bytes, contentType } = await downloadBookBytes(url, targetLabel);
   // Nom de PJ = nom du fichier réel (pas du dossier racine).
   const filename = sanitizeFileName(targetLabel.split('/').pop() ?? item.name);
   const displayName = filename;
 
   if (!Capacitor.isNativePlatform()) {
-    // Web/exe : pas de composeur natif -> on télécharge le fichier et on
-    // pré-remplit un mailto (pièce jointe à ajouter à la main).
+    // Web/PWA : Web Share API niveau 2 (Safari iOS 15+, Chrome Android) ->
+    // vraie pièce jointe vers Mail/Gmail. Le destinataire n'est pas
+    // pré-remplissable : on le rappelle dans le texte.
+    const shared = await shareBookFileWeb(bytes, contentType, filename, displayName, recipient);
+    if (shared !== null) return shared;
+    // Repli : téléchargement navigateur + mailto pré-rempli (PJ à la main).
     const blob = new Blob([bytes.buffer as ArrayBuffer], { type: 'application/octet-stream' });
     const objectUrl = URL.createObjectURL(blob);
     try {

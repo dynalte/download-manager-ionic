@@ -70,6 +70,15 @@
         même hôte que Transmission). Méthodes autorisées : torrent-get/add/remove,
         torrent-set-location, session-stats/get. Auth Transmission transmise par
         requête (jamais stockée). Le token X-API-Token reste exigé (anti proxy ouvert).
+      Envoi e-book côté serveur (Send-to-Kindle depuis la PWA : mailto ne
+      peut pas joindre de PJ) :
+      POST ?action=book_send {downloadDir, name, innerFile?, to}
+                                               → {ok:true, sent:true}
+        Fichier résolu sous la cage WIPE_MAP, extension e-book exigée, 24 Mo
+        max (limite Gmail). Destinataire : *@kindle.com ou liste env
+        BOOK_SEND_ALLOW (anti relais ouvert). SMTP via env SMTP_HOST/PORT/USER/
+        PASS/FROM (ex: smtp.gmail.com:587 + mot de passe d'application ; penser
+        à approuver l'expéditeur côté Amazon, sinon rejet silencieux).
 */
 declare(strict_types=1);
 
@@ -1090,4 +1099,239 @@ if ($action === 'transmission_rpc') {
     out(['ok' => true, 'status' => $status, 'sessionId' => $respSession, 'body' => $respBody]);
 }
 
-fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download, c411_detail, allocine_ratings, v3x_search, v3x_download, v3x_detail, transmission_rpc).', 400);
+
+// ---------- Envoi e-book côté serveur (Send-to-Kindle) ----------
+
+const BOOK_SEND_EXTENSIONS = ['epub', 'pdf', 'mobi', 'azw', 'azw3', 'kfx', 'txt'];
+const BOOK_SEND_MAX_BYTES = 24 * 1024 * 1024; // plafond Gmail : 25 Mo
+
+function book_send_smtp_config(): array
+{
+    $user = trim((string) (getenv('SMTP_USER') ?: ''));
+    // Mot de passe d'application : Google l'affiche par groupes de 4
+    // lettres, les espaces sont ignorés (avec ou sans).
+    $pass = str_replace(' ', '', (string) (getenv('SMTP_PASS') ?: ''));
+    return [
+        'host' => trim((string) (getenv('SMTP_HOST') ?: 'smtp.gmail.com')),
+        'port' => (int) (getenv('SMTP_PORT') ?: 587),
+        'user' => $user,
+        'pass' => $pass,
+        'from' => trim((string) (getenv('SMTP_FROM') ?: $user)),
+        'fromName' => trim((string) (getenv('SMTP_FROM_NAME') ?: 'Download Manager')),
+    ];
+}
+
+/** Anti relais ouvert : Send-to-Kindle ou adresses explicitement autorisées. */
+function book_send_to_allowed(string $to): bool
+{
+    $to = strtolower(trim($to));
+    if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+        return false;
+    }
+    if (str_ends_with($to, '@kindle.com')) {
+        return true;
+    }
+    $extra = (string) (getenv('BOOK_SEND_ALLOW') ?: '');
+    foreach (explode(',', $extra) as $e) {
+        if (strtolower(trim($e)) !== '' && strtolower(trim($e)) === $to) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function book_send_mime(string $filename): string
+{
+    $lower = strtolower($filename);
+    if (str_ends_with($lower, '.epub')) {
+        return 'application/epub+zip';
+    }
+    if (str_ends_with($lower, '.pdf')) {
+        return 'application/pdf';
+    }
+    if (str_ends_with($lower, '.txt')) {
+        return 'text/plain';
+    }
+    if (str_ends_with($lower, '.mobi') || str_ends_with($lower, '.azw') || str_ends_with($lower, '.azw3') || str_ends_with($lower, '.kfx')) {
+        return 'application/x-mobipocket-ebook';
+    }
+    return 'application/octet-stream';
+}
+
+/** Encodage RFC 2047 pour les en-têtes non-ASCII (sujet, nom, nom de PJ). */
+function book_send_header(string $s): string
+{
+    if (preg_match('/^[\x20-\x7e]*$/', $s)) {
+        return str_contains($s, '"') ? '"' . str_replace('"', '', $s) . '"' : $s;
+    }
+    return '=?UTF-8?B?' . base64_encode($s) . '?=';
+}
+
+/** Client SMTP minimal (STARTTLS sur 587, TLS implicite sur 465, AUTH LOGIN). */
+function book_send_smtp(array $cfg, string $to, string $subject, string $plainBody, string $filename, string $filedata, string $filemime): void
+{
+    $secure = ((int) $cfg['port']) === 465;
+    $fp = @stream_socket_client(
+        ($secure ? 'ssl://' : 'tcp://') . $cfg['host'] . ':' . (int) $cfg['port'],
+        $errno,
+        $errstr,
+        15
+    );
+    if (!$fp) {
+        fail('SMTP : connexion impossible (' . ($errstr !== '' ? $errstr : 'échec réseau') . ').', 502);
+    }
+    stream_set_timeout($fp, 20);
+    $read = function () use ($fp): array {
+        $text = '';
+        while (($line = fgets($fp, 512)) !== false) {
+            $text .= $line;
+            if (preg_match('/^\d{3} /', $line)) {
+                break;
+            }
+        }
+        if ($text === '') {
+            fail('SMTP : réponse illisible (délai dépassé ?).', 502);
+        }
+        return [(int) substr($text, 0, 3), $text];
+    };
+    $cmd = function (string $c, array $expect) use ($fp, $read): void {
+        fwrite($fp, $c . "\r\n");
+        [$code, $text] = $read();
+        if (!in_array($code, $expect, true)) {
+            fail('SMTP : commande rejetée (' . trim(explode("\n", $text)[0]) . ').', 502);
+        }
+    };
+    [$code] = $read(); // bannière
+    if ($code !== 220) {
+        fail('SMTP : bannière inattendue.', 502);
+    }
+    $cmd('EHLO download-manager', [250]);
+    if (!$secure) {
+        $cmd('STARTTLS', [220]);
+        if (!@stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+            fail('SMTP : STARTTLS impossible.', 502);
+        }
+        $cmd('EHLO download-manager', [250]);
+    }
+    $cmd('AUTH LOGIN', [334]);
+    $cmd(base64_encode($cfg['user']), [334]);
+    $cmd(base64_encode($cfg['pass']), [235]);
+    $cmd('MAIL FROM:<' . $cfg['from'] . '>', [250]);
+    $cmd('RCPT TO:<' . $to . '>', [250, 251]);
+    $cmd('DATA', [354]);
+    $boundary = 'dlm_' . md5(uniqid('', true));
+    $lines = [
+        'From: ' . book_send_header($cfg['fromName']) . ' <' . $cfg['from'] . '>',
+        'To: <' . $to . '>',
+        'Subject: ' . book_send_header($subject),
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="' . $boundary . '"',
+        '',
+        '--' . $boundary,
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: 8bit',
+        '',
+        $plainBody,
+        '',
+        '--' . $boundary,
+        'Content-Type: ' . $filemime . '; name="' . book_send_header($filename) . '"',
+        'Content-Transfer-Encoding: base64',
+        'Content-Disposition: attachment; filename="' . book_send_header($filename) . '"',
+        '',
+        chunk_split(base64_encode($filedata), 76, "\r\n"),
+        '--' . $boundary . '--',
+        '',
+    ];
+    // Dot-stuffing (lignes commençant par un point).
+    $data = '';
+    foreach (explode("\n", implode("\n", $lines)) as $l) {
+        $l = rtrim($l, "\r");
+        if (str_starts_with($l, '.')) {
+            $l = '.' . $l;
+        }
+        $data .= $l . "\r\n";
+    }
+    fwrite($fp, $data . ".\r\n");
+    [$code, $text] = $read();
+    if ($code !== 250) {
+        fail('SMTP : message refusé (' . trim(explode("\n", $text)[0]) . ').', 502);
+    }
+    fwrite($fp, "QUIT\r\n");
+    fclose($fp);
+}
+
+if ($action === 'book_send') {
+    $input = json_decode(file_get_contents('php://input') ?: 'null', true);
+    if (!is_array($input)) {
+        fail('Corps JSON invalide.', 400);
+    }
+    $to = trim((string) ($input['to'] ?? ''));
+    if (!book_send_to_allowed($to)) {
+        fail('Destinataire non autorisé (Send-to-Kindle ou BOOK_SEND_ALLOW).', 403);
+    }
+    $location = trim((string) ($input['downloadDir'] ?? ''));
+    $name = trim((string) ($input['name'] ?? ''));
+    $inner = trim((string) ($input['innerFile'] ?? ''));
+    if ($name === '' || str_contains($name, '/') || str_contains($name, "\0") || $name === '.' || $name === '..') {
+        fail('Nom invalide.', 400);
+    }
+    if ($inner !== '' && (str_contains($inner, "\0") || str_contains($inner, '..') || str_starts_with($inner, '/'))) {
+        fail('Fichier interne invalide.', 400);
+    }
+    // Même cage que files_wipe : préfixes WIPE_MAP uniquement.
+    $base = null;
+    foreach (WIPE_MAP as $prefix => $dir) {
+        if ($location === $prefix || str_starts_with($location, $prefix . '/')) {
+            $base = $dir . substr($location, strlen($prefix));
+            break;
+        }
+    }
+    if ($base === null) {
+        fail('Emplacement non autorisé.', 403);
+    }
+    $rel = $name;
+    if ($inner !== '') {
+        $rel = (str_starts_with($inner, $name . '/') || $inner === $name) ? $inner : $name . '/' . $inner;
+    }
+    $target = $base . '/' . $rel;
+    $ext = strtolower(pathinfo($target, PATHINFO_EXTENSION));
+    if (!in_array($ext, BOOK_SEND_EXTENSIONS, true)) {
+        fail('Extension non envoyable (e-book requis).', 400);
+    }
+    $realParent = realpath(dirname($target));
+    $realBase = realpath($base);
+    if ($realParent === false || $realBase === false || ($realParent !== $realBase && !str_starts_with($realParent, $realBase . '/'))) {
+        fail('Emplacement non autorisé.', 403);
+    }
+    if (!is_file($target)) {
+        fail('Fichier introuvable sur le serveur.', 404);
+    }
+    $size = filesize($target);
+    if ($size === false || $size <= 0) {
+        fail('Fichier vide ou illisible.', 400);
+    }
+    if ($size > BOOK_SEND_MAX_BYTES) {
+        fail('Fichier trop volumineux pour un envoi e-mail (24 Mo max).', 400);
+    }
+    $data = @file_get_contents($target);
+    if ($data === false || $data === '') {
+        fail('Lecture du fichier impossible.', 500);
+    }
+    $cfg = book_send_smtp_config();
+    if ($cfg['user'] === '' || $cfg['pass'] === '' || $cfg['from'] === '') {
+        fail('Envoi e-mail non configuré (SMTP_USER/SMTP_PASS/SMTP_FROM).', 500);
+    }
+    $filename = basename($target);
+    book_send_smtp(
+        $cfg,
+        $to,
+        '[Livre] ' . $filename,
+        'Envoi depuis Download Manager : ' . $filename,
+        $filename,
+        $data,
+        book_send_mime($filename)
+    );
+    out(['ok' => true, 'sent' => true]);
+}
+
+fail('Action inconnue (ping, list, add, clear, subs_list, subs_upsert, subs_remove, files_wipe, disk_space, config_get, config_set, c411_search, c411_download, c411_detail, allocine_ratings, v3x_search, v3x_download, v3x_detail, transmission_rpc, book_send).', 400);
